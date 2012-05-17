@@ -23,6 +23,7 @@ typedef struct {
 #ifdef CONFIG_PCRE
 typedef struct {
 	pcre* pattern;
+	pcre_extra* studyData;
 	const char* replace;
 	int destLogIdx;
 } retention_pattern_t;
@@ -205,8 +206,42 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 }
 
 bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
-	// format is ident:/regex/[replacement/][flags]
-	return false;
+	const char* errmsg, dispStart, dispEnd;
+	int errofs;
+	
+	if (!self->currentCategory) {
+		fprintf(stderr, "Cannot specify patterns before first '--log'\n");
+		return false;
+	}
+
+	self->pattern= realloc(self->pattern, (self->patternCount+1) * sizeof(self->patten[0]));
+	if (!self->pattern) {
+		perror("realloc(logSpec)");
+		exit_runtime_fail();
+	}
+	
+	retention_pattern_t *pat= self->pattern[self->patternCount];
+	pat->pattern= pcre_compile(spec, 0, &errmsg, &errofs, NULL);
+	if (!pat->pattern) {
+		// Failed to compile.  Display a helpful syntax error.
+		dispStart= (errofs>20)? pattern+errofs-20 : pattern;
+		dispEnd= dispStart+strlen(dispStart);
+		if (dispEnd - dispStart > 60) dispEnd= dispStart+60;
+		fprintf(stderr, "Regular Expression Syntax Error: %s\n %s%.*s%s\n    %*s\n\n",
+			errmsg,
+			dispStart==pattern? "  \"":"...", dispEnd-dispStart, dispStart, *dispEnd? "...":"\"",
+			errofs+1-(dispStart-pattern), "^");
+		exit(2);
+	}
+	pat->studyData= pcre_study(pat->pattern, 0, &errmsg);
+	if (errmsg) {
+		fprintf(stderr, "Error studying pattern: %s", errmsg);
+		exit_runtime_fail();
+	}
+	pat->replace= NULL; // not supported yet
+	pat->destLogIdx= self->currentCategory - self->category;
+	self->patternCount++;
+	return true;
 }
 
 bool ccl_sanityCheck(circulog_t* self) {
@@ -250,10 +285,16 @@ bool ccl_parseOptions(circulog_t* self, char** argv) {
 							return false;
 			}
 		} else {
-			// implied '-l'
 			optval= *argv++;
-			if (!ccl_processOption(self, '\xFF', "log", optval, &argv))
-				return false;
+			if (optval[0] == '+') {
+				// implied '-p'
+				if (!ccl_processOption(self, '\xFF', "pattern", optval+1, &argv))
+					return false;
+			} else {
+				// implied '-l'
+				if (!ccl_processOption(self, '\xFF', "log", optval, &argv))
+					return false;
+			}
 		}
 	}
 	return true;
@@ -333,7 +374,10 @@ bool ccl_processOption(circulog_t *self, char shortOpt, char* longOpt, char* opt
 	CASE('m', "max-msg", 1)
 		if (!parseSize(&size, optVal))
 			return BADVAL;
-	
+		
+		// The file format uses 32-bit msg lengths, so this is a hard-limit.
+		// Anything over a few MB is probably too big for practical reasons,
+		//  but we check that in ccl_sanityCheck()
 		if (size > 0xFFFFFFFFLL) {
 			fprintf(stderr, "Max message size too large: %s", optVal);
 			return false;
@@ -419,7 +463,8 @@ void exit_usage(int stream, int exitcode) {
 		"    -R --resize          (per-log) Force the log file to be resized\n"
 		"    -p --pattern PATTERN (per-log, multiple) Add a pattern to previous '--log'\n"
 		"\n"
-		"  Bare arguments are interpreted as '--log'.\n"
+		"  Bare arguments are interpreted as '--log' unless they start with '+' in which\n"
+		"    case they are interpreted as '--pattern'\n"
 		"  Options marked as \"per-log\" will affect the preceeding '--log' file,\n"
 		"    or they will affect the default if no '--log' options have been given yet.\n"
 		"  Pattens are of the form /REGEX[/REPLACE]/FLAG\n"
