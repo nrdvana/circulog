@@ -1,0 +1,29 @@
+#! /bin/sh
+
+srcroot="`dirname "$(realpath $0)"`";
+buildroot="`realpath "$PWD"`";
+
+if [[ "$buildroot" == "$srcroot" ]]; then
+	echo "Building in same directory as source is not supported."
+	echo "Using subdir 'build'";
+	buildroot="$buildroot/build";
+	mkdir -p "$buildroot";
+fi
+
+cat >"$buildroot/config.mk" <<END
+# --- begin config.mk ---
+
+export srcroot:=$srcroot
+export buildroot:=$buildroot
+QUIET=yes
+
+# --- end config.mk ---
+END
+
+cat "$buildroot/config.mk" "$srcroot/Makefile.mlc" >"$buildroot/Makefile"
+
+echo "Makefile created at $buildroot";
+
+touch "$buildroot/config.h"
+
+echo "Created config.h"
