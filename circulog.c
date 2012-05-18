@@ -1,4 +1,7 @@
+#include "config.h"
 #include "circulog.h"
+
+#define _FILE_OFFSET_BITS 64
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -245,11 +248,71 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 }
 
 bool ccl_sanityCheck(circulog_t* self) {
+	// Maximum message size must be less than 1/4 of the total log size
+	int i;
+	for (i=0; i<self->categoryCount; i++) {
+		if (self->category[i].maxMsgSize > (self->category[i].logSize>>2)) {
+			if (self->verbose >= -1)
+				fprintf(stderr, "ERROR: Maximum message size (%d) exceeds 1/4 of log size (%lld) for \"%s\"",
+					self->category[i].maxMsgSize, self->category[i].logSize, self->category[i].fileName);
+		}
+		if (self->category[i].maxMsgSize > 1024*1024) {
+			if (self->verbose >= 0)
+				fprintf(stderr, "WARNING: Max message size of %d will cause circulog to allocate an inconveniently large buffer."
+					"  Carefully consider whether you really want to allow messages this large.\n", self->category[i].maxMsgSize);
+		}
+	}
 	return false;
 }
 
 bool ccl_openLogFiles(circulog_t* self) {
-	return false;
+	int i;
+	struct stat info;
+	off_t ofs; // 64-bit, with #define at top of this file
+	
+	for (i=0; i<self->categoryCount; i++) {
+		self->category[i].fd= open(self->category[i].fileName, O_RDWR);
+		if (self->category[i].fd == -1) {
+			// failed to open the file.  See if the reason was that it didn't exist...
+			if (errno == ENOENT && self->createIfMissing) {
+				if (!ccl_createLogFile(self, self->category+i))
+					return false;
+			}
+			else {
+				char buf[256];
+				snprintf(buf, sizeof(buf), "open(%s)", self->category[i].fileName);
+				perror(buf);
+				return false;
+			}
+		}
+		
+		// check if it is the correct format
+		TODO
+		
+		// check if the size is ok
+		ofs= lseek(self->category[i].fd, 0, SEEK_END);
+		if (ofs == (off_t)-1) {
+			perror("seek");
+			return false;
+		}
+		if (ofs < self->category[i].logSize) {
+			if (self->category[i].resizeLog) {
+				if (!ccl_resizeLogFile(self, self->category+i))
+					return false;
+			} else {
+				if (self->category[i].maxMsgSize > (ofs>>2)) {
+					fprintf(stderr, "ERROR: Actual log size of \"%s\" is %lld, which is less than 4x the max message size (%d)\n",
+						self->category[i].fileName, ofs, self->category[i].maxMsgSize);
+					return false;
+				}
+				else if (self->verbose >= 1) {
+					fprintf(stderr, "NOTICE: Actual log size of \"%s\" is smaller than requested \"%lld\"\n",
+						self->category[i].fileName, self->category[i].logSize);
+				}
+			}
+		}
+	}
+	return true;
 }
 
 bool ccl_handleMessage(circulog_t* self, const char* msg, int msgLen) {
