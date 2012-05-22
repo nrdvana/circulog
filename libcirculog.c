@@ -2,8 +2,18 @@
 #include "circulog_internal.h"
 
 static const char* errorTable[]= {
-	/* CCL_ESYSERR */ "%s",
-	/* CCL_ELOGVERSION */ "Unsupported log file version",
+	/* CCL_ESYSERR       */ "%m",
+	/* CCL_ELOGSTRUCT    */ "Log object is invalid",
+	/* CCL_ELOGOPEN      */ "Failed to open log file: %m",
+	/* CCL_ELOGVERSION   */ "Unsupported log file version",
+	/* CCL_ELOGINVAL     */ "Invalid log format",
+	/* CCL_ELOGREAD      */ "Failed to read log: %m",
+	/* CCL_ERESIZERDONLY */ "Cannot resize log opened in read-mode",
+	/* CCL_ERESIZECREATE */ "Log resize failed: Unable to create temp log file: %m",
+	/* CCL_ERESIZENAME   */ "Log resize failed: Temp log file name too long",
+	/* CCL_EGETLOCK      */ "Failed to lock log file.  fcntl: %m",
+	/* CCL_EDROPLOCK     */ "Failed to unlock log file. fcntl: %m",
+	/* CCL_ERESIZERENAME */ "Failed to rename resized file to log file: %m",
 };
 
 ccl_log_t *ccl_new() {
@@ -395,13 +405,6 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, 
 	return true;
 }
 
-// 1/65536 of a second is 15.26 ns, so we round by adding 8
-// These constants were checked to prove that
-//   ((nsec * multiplier + adder) >> shift) == ((nsec+8)<<16)/1000000
-// for every value in the set [0 .. 999999]
-#define TS_NSEC_MULTIPLIER 562949953LL
-#define TS_NSEC_ADDER 562949953LL
-#define TS_NSEC_SHIFT 49
 int64_t ccl_get_timestamp(struct timespec *t) {
 	#ifdef _POSIX_TIMERS
 	struct timespec t2;
@@ -413,13 +416,11 @@ int64_t ccl_get_timestamp(struct timespec *t) {
 	#else
 	if (!t) return ((int64_t) time(NULL)) << 16;
 	#endif
-	// 1/65536 of a second is 15.26 ns, so we round by adding 8
-	// equivalent of (sec<<16) + ((nsec+8)<<16)/1000000
-	return (((int64_t) t->tv_sec) << 16) | ((t->tv_nsec * TS_NSEC_MULTIPLIER + TS_NSEC_ADDER) >> TS_NSEC_SHIFT);
+	return (((int64_t) t->tv_sec) << 16) | CCL_NSEC_TO_16BIT_FRAC(t->tv_nsec);
 }
 
 void ccl_split_timestamp(int64_t ts, struct timespec *t_out) {
-	t_out->tv_nsec= (long) (((ts & 0xFFFFLL) * 1000000LL) >> 16);
+	t_out->tv_nsec= CCL_16BIT_FRAC_TO_NSEC(ts & 0xFFFFLL);
 	t_out->tv_sec=  (time_t) (ts >> 16);
 }
 

@@ -27,12 +27,15 @@ circulog: $(circulog_objs)
 cltail: $(cltail_objs)
 	$(LINK) -o $@ $(cltail_objs) $(LIBS)
 
-libcirculog: libcirculog.a libcirculog.so
+libcirculog: libcirculog.a libcirculog.so.0.0.0
 
 libcirculog.a: $(libcirculog_objs)
 	$(MKSTATICLIB) $@ $<
 
-libcirculog.so: $(libcirculog_objs)
+libcirculog.o: libcirculog.c
+	$(COMPILE_C) -fpic -o $@ $<
+
+libcirculog.so.0.0.0: $(libcirculog_objs)
 	$(MKSHAREDLIB) $@ $<
 
 install: $(targets)
@@ -40,4 +43,7 @@ install: $(targets)
 	$(INST) -m 555 -o root -g root -s circulog $(DESTDIR)/bin/circulog
 	$(INST) -m 555 -o root -g root -s cltail $(DESTDIR)/bin/cltail
 
-.PHONY: all install libcirculog
+clean:
+	rm *.o
+
+.PHONY: all install libcirculog clean

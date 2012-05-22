@@ -50,6 +50,17 @@ typedef struct {
 #define CCL_EDROPLOCK     10
 #define CCL_ERESIZERENAME 11
 
+// 1/65536 of a second is 15.26 ns, so we round by adding 8
+// These constants were checked to prove that
+//   ((nsec * multiplier + adder) >> shift) == ((nsec+8)<<16)/1000000
+// for every value in the set [0 .. 999999]
+#define CCL_TS_NSEC_MULTIPLIER 562949953LL
+#define CCL_TS_NSEC_ADDER 562949953LL
+#define CCL_TS_NSEC_SHIFT 49
+
+#define CCL_NSEC_TO_16BIT_FRAC(nsec) (((nsec) * CCL_TS_NSEC_MULTIPLIER + CCL_TS_NSEC_ADDER) >> CCL_TS_NSEC_SHIFT)
+#define CCL_16BIT_FRAC_TO_NSEC(frac) ((long) (((frac) * 1000000LL) >> 16))
+
 extern const char* ccl_err_text(ccl_log_t* log, char* buf, int bufLen);
 
 extern ccl_log_t *ccl_new();
@@ -58,7 +69,7 @@ extern bool ccl_destroy(ccl_log_t *log);
 extern bool ccl_delete(ccl_log_t *log);
 
 extern bool ccl_open(ccl_log_t *log, const char *path);
-extern bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create);
+extern bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, bool force);
 
 extern int64_t ccl_get_timestamp(struct timespec *t);
 extern void ccl_split_timestamp(int64_t ts, struct timespec *t_out);

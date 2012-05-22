@@ -13,7 +13,7 @@ COMPILE_C   += $(CC) -MMD $(CFLAGS) -c
 COMPILE_CXX += $(CXX) -MMD $(CXXFLAGS) -c
 LINK        += $(CXX) $(LDFLAGS)
 MKSTATICLIB += $(AR) rcs
-MKSHAREDLIB += $(LD) -shared -Wl,-soname,`echo '$@'|sed 's/\.[^.]*\.[^.]*$//'`
+MKSHAREDLIB += $(CC) -shared -Wl,-soname,`echo '$@'|sed 's/\.[^.]*\.[^.]*$$//'` -o
 
 STRIP = strip
 INSTALL = install
