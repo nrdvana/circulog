@@ -1,26 +1,18 @@
 #include "config.h"
 #include "circulog.h"
 
-#define _FILE_OFFSET_BITS 64
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
 
-// For now, we require PCRE.  I'd like to make it optional in the future.
-#define CONFIG_PCRE
-
-#ifdef CONFIG_PCRE
-#include <pcre.h>
-#endif
-
 typedef struct {
 	const char* fileName;
-	int fd;
 	long long logSize;
 	int maxMsgSize;
 	bool resizeLog;
+	ccl_log_t *log;
 } retention_category_t;
 
 #ifdef CONFIG_PCRE
@@ -189,6 +181,7 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 		perror("realloc(logSpec)");
 		exit_runtime_fail();
 	}
+	memset(self->category+self->categoryCount, 0, sizeof(self->category[0]));
 	
 	// initialize new category
 	cat= self->category + self->categoryCount;
@@ -197,7 +190,6 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 		perror("strdup");
 		exit_runtime_fail();
 	}
-	cat->fd= -1;
 	cat->logSize= self->defaultLogSize;
 	cat->maxMsgSize= self->defaultMaxMsgSize;
 	cat->resizeLog= self->defaultResizeLog;
@@ -213,7 +205,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 	int errofs;
 	
 	if (!self->currentCategory) {
-		fprintf(stderr, "Cannot specify patterns before first '--log'\n");
+		fprintf(stderr, "ERROR: Cannot specify patterns before first '--log'\n");
 		return false;
 	}
 
@@ -222,6 +214,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 		perror("realloc(logSpec)");
 		exit_runtime_fail();
 	}
+	memset(self->pattern+self->patternCount, 0, sizeof(self->pattern[0]));
 	
 	retention_pattern_t *pat= self->pattern[self->patternCount];
 	pat->pattern= pcre_compile(spec, 0, &errmsg, &errofs, NULL);
@@ -230,7 +223,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 		dispStart= (errofs>20)? pattern+errofs-20 : pattern;
 		dispEnd= dispStart+strlen(dispStart);
 		if (dispEnd - dispStart > 60) dispEnd= dispStart+60;
-		fprintf(stderr, "Regular Expression Syntax Error: %s\n %s%.*s%s\n    %*s\n\n",
+		fprintf(stderr, "ERROR: Invalid Regular Expression Syntax: %s\n %s%.*s%s\n    %*s\n\n",
 			errmsg,
 			dispStart==pattern? "  \"":"...", dispEnd-dispStart, dispStart, *dispEnd? "...":"\"",
 			errofs+1-(dispStart-pattern), "^");
@@ -238,7 +231,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 	}
 	pat->studyData= pcre_study(pat->pattern, 0, &errmsg);
 	if (errmsg) {
-		fprintf(stderr, "Error studying pattern: %s", errmsg);
+		fprintf(stderr, "ERROR: \"pcre_study\" failed for \"%s\"", errmsg);
 		exit_runtime_fail();
 	}
 	pat->replace= NULL; // not supported yet
@@ -250,11 +243,18 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 bool ccl_sanityCheck(circulog_t* self) {
 	// Maximum message size must be less than 1/4 of the total log size
 	int i;
+	if (self->categoryCount == 0) {
+		if (self->verbose >= 0)
+			fprintf(stderr, "ERROR: no log files specified\n");
+		return false;
+	}
+	
 	for (i=0; i<self->categoryCount; i++) {
 		if (self->category[i].maxMsgSize > (self->category[i].logSize>>2)) {
 			if (self->verbose >= -1)
 				fprintf(stderr, "ERROR: Maximum message size (%d) exceeds 1/4 of log size (%lld) for \"%s\"",
 					self->category[i].maxMsgSize, self->category[i].logSize, self->category[i].fileName);
+			return false;
 		}
 		if (self->category[i].maxMsgSize > 1024*1024) {
 			if (self->verbose >= 0)
@@ -262,17 +262,17 @@ bool ccl_sanityCheck(circulog_t* self) {
 					"  Carefully consider whether you really want to allow messages this large.\n", self->category[i].maxMsgSize);
 		}
 	}
-	return false;
+	return true;
 }
 
 bool ccl_openLogFiles(circulog_t* self) {
-	int i;
+	int i, err;
 	struct stat info;
 	off_t ofs; // 64-bit, with #define at top of this file
 	
 	for (i=0; i<self->categoryCount; i++) {
-		self->category[i].fd= open(self->category[i].fileName, O_RDWR);
-		if (self->category[i].fd == -1) {
+		self->category[i].log= ccl_open(self->category[i].fileName, false, &err);
+		if (!self->category[i].log) {
 			// failed to open the file.  See if the reason was that it didn't exist...
 			if (errno == ENOENT && self->createIfMissing) {
 				if (!ccl_createLogFile(self, self->category+i))
@@ -286,17 +286,10 @@ bool ccl_openLogFiles(circulog_t* self) {
 			}
 		}
 		
-		// check if it is the correct format
-		TODO
-		
 		// check if the size is ok
-		ofs= lseek(self->category[i].fd, 0, SEEK_END);
-		if (ofs == (off_t)-1) {
-			perror("seek");
-			return false;
-		}
-		if (ofs < self->category[i].logSize) {
+		if (self->category[i].log->size < self->category[i].logSize) {
 			if (self->category[i].resizeLog) {
+				
 				if (!ccl_resizeLogFile(self, self->category+i))
 					return false;
 			} else {
@@ -316,6 +309,16 @@ bool ccl_openLogFiles(circulog_t* self) {
 }
 
 bool ccl_handleMessage(circulog_t* self, const char* msg, int msgLen) {
+	ccl_message_into_t msg;
+	
+	// TODO: figure out which log it belongs to
+	
+	msg.timestamp= 0; // ask lib to run clock_gettime
+	msg.msglen= msgLen;
+	msg.data_ofs= 0;
+	msg.data_len= msgLen;
+	msg.data= (void*) msg;
+	ccl_write_message(&msg);
 	return false;
 }
 

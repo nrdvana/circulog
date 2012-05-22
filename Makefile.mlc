@@ -1,10 +1,15 @@
 srcdir:=$(srcroot)
 
-targets = circulog cltail
+targets = libcirculog circulog cltail
+
 circulog_src = circulog.c version.c
-circulog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(circulog_src)))
+circulog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(circulog_src))) libcirculog.a
+
 cltail_src = cltail.c
-cltail_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(cltail_src)))
+cltail_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(cltail_src))) libcirculog.a
+
+libcirculog_src = libcirculog.c
+libcirculog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(libcirculog_src)))
 
 CCOPTS += -Os -g3
 INCPATH += -I$(srcdir)
@@ -22,9 +27,17 @@ circulog: $(circulog_objs)
 cltail: $(cltail_objs)
 	$(LINK) -o $@ $(cltail_objs) $(LIBS)
 
+libcirculog: libcirculog.a libcirculog.so
+
+libcirculog.a: $(libcirculog_objs)
+	$(MKSTATICLIB) $@ $<
+
+libcirculog.so: $(libcirculog_objs)
+	$(MKSHAREDLIB) $@ $<
+
 install: $(targets)
 	$(INST) -d -m 755 -o root -g root $(DESTDIR)/bin/
 	$(INST) -m 555 -o root -g root -s circulog $(DESTDIR)/bin/circulog
 	$(INST) -m 555 -o root -g root -s cltail $(DESTDIR)/bin/cltail
 
-.PHONY: all install
+.PHONY: all install libcirculog
