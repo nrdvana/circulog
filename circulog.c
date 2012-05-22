@@ -62,15 +62,14 @@ void exit_version();
 void exit_runtime_fail();
 
 int main(int argc, char** argv) {
-	const char **item;
 	char *buffer, *start, *limit, *eol;
 	int i, got, bufLen;
 	bool eof, skipCurrent;
 	circulog_t self;
 	
 	memset(&self, 0, sizeof(self));
-	self.defaultMaxMsgSize= DEFAULT_MAX_MESSAGE_SIZE;
-	self.defaultLogSize= DEFAULT_LOG_SIZE;
+	self.defaultMaxMsgSize= CCL_DEFAULT_MAX_MESSAGE_SIZE;
+	self.defaultLogSize= CCL_DEFAULT_LOG_SIZE;
 	self.createIfMissing= true;
 	
 	if (!ccl_parseOptions(&self, argv+1))
@@ -104,7 +103,7 @@ int main(int argc, char** argv) {
 			limit += got;
 			*limit= '\0';
 			// now see how many lines (messages) we can make from the buffer
-			while (eol= strchr(eol, '\n')) {
+			while ((eol= strchr(eol, '\n'))) {
 				// handle message
 				if (skipCurrent)
 					skipCurrent= false;
@@ -150,6 +149,11 @@ int main(int argc, char** argv) {
 	return 0;
 }
 
+#define Error(fmt, args...)  do { if (self->verbose < -1) fprintf(stderr, "ERROR: "   fmt "\n" , ## args); } while (0)
+#define Warn(fmt, args...)   do { if (self->verbose < 0)  fprintf(stderr, "WARNING: " fmt "\n" , ## args); } while (0)
+#define Notice(fmt, args...) do { if (self->verbose < 1)  fprintf(stderr, "NOTICE: "  fmt "\n" , ## args); } while (0)
+#define Debug(fmt, args...)  do { if (self->verbose < 2)  fprintf(stderr, "DEBUG: "   fmt "\n" , ## args); } while (0)
+
 bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 	char name[256];
 	int i;
@@ -157,7 +161,7 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 	
 	int len= (self->logBaseName? strlen(self->logBaseName) : 0)+strlen(suffix);
 	if (len+1 > sizeof(name)) {
-		fprintf(stderr, "Log filename too long (%d)", len);
+		Error("Log filename too long (%d)", len);
 		return false;
 	}
 	name[0]= '\0';
@@ -178,7 +182,7 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 	// It doesn't exist, so we create it
 	self->category= realloc(self->category, (self->categoryCount+1) * sizeof(self->category[0]));
 	if (!self->category) {
-		perror("realloc(logSpec)");
+		Error("realloc(logSpec): %m");
 		exit_runtime_fail();
 	}
 	memset(self->category+self->categoryCount, 0, sizeof(self->category[0]));
@@ -187,7 +191,7 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 	cat= self->category + self->categoryCount;
 	cat->fileName= strdup(name);
 	if (!cat->fileName) {
-		perror("strdup");
+		Error("strdup: %m");
 		exit_runtime_fail();
 	}
 	cat->logSize= self->defaultLogSize;
@@ -201,37 +205,37 @@ bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 }
 
 bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
-	const char* errmsg, dispStart, dispEnd;
+	const char *errmsg, *dispStart, *dispEnd;
 	int errofs;
 	
 	if (!self->currentCategory) {
-		fprintf(stderr, "ERROR: Cannot specify patterns before first '--log'\n");
+		Error("Cannot specify patterns before first '--log'\n");
 		return false;
 	}
 
-	self->pattern= realloc(self->pattern, (self->patternCount+1) * sizeof(self->patten[0]));
+	self->pattern= realloc(self->pattern, (self->patternCount+1) * sizeof(self->pattern[0]));
 	if (!self->pattern) {
-		perror("realloc(logSpec)");
+		Error("realloc(logSpec): %m");
 		exit_runtime_fail();
 	}
 	memset(self->pattern+self->patternCount, 0, sizeof(self->pattern[0]));
 	
-	retention_pattern_t *pat= self->pattern[self->patternCount];
+	retention_pattern_t *pat= self->pattern+self->patternCount;
 	pat->pattern= pcre_compile(spec, 0, &errmsg, &errofs, NULL);
 	if (!pat->pattern) {
 		// Failed to compile.  Display a helpful syntax error.
-		dispStart= (errofs>20)? pattern+errofs-20 : pattern;
+		dispStart= (errofs>20)? spec+errofs-20 : spec;
 		dispEnd= dispStart+strlen(dispStart);
 		if (dispEnd - dispStart > 60) dispEnd= dispStart+60;
-		fprintf(stderr, "ERROR: Invalid Regular Expression Syntax: %s\n %s%.*s%s\n    %*s\n\n",
+		Error("Invalid Regular Expression Syntax: %s\n %s%.*s%s\n    %*s\n",
 			errmsg,
-			dispStart==pattern? "  \"":"...", dispEnd-dispStart, dispStart, *dispEnd? "...":"\"",
-			errofs+1-(dispStart-pattern), "^");
+			dispStart==spec? "  \"":"...", dispEnd-dispStart, dispStart, *dispEnd? "...":"\"",
+			errofs+1-(dispStart-spec), "^");
 		exit(2);
 	}
 	pat->studyData= pcre_study(pat->pattern, 0, &errmsg);
 	if (errmsg) {
-		fprintf(stderr, "ERROR: \"pcre_study\" failed for \"%s\"", errmsg);
+		Error("\"pcre_study\" failed for \"%s\"", errmsg);
 		exit_runtime_fail();
 	}
 	pat->replace= NULL; // not supported yet
@@ -245,63 +249,69 @@ bool ccl_sanityCheck(circulog_t* self) {
 	int i;
 	if (self->categoryCount == 0) {
 		if (self->verbose >= 0)
-			fprintf(stderr, "ERROR: no log files specified\n");
+			Error("no log files specified");
 		return false;
 	}
 	
 	for (i=0; i<self->categoryCount; i++) {
 		if (self->category[i].maxMsgSize > (self->category[i].logSize>>2)) {
-			if (self->verbose >= -1)
-				fprintf(stderr, "ERROR: Maximum message size (%d) exceeds 1/4 of log size (%lld) for \"%s\"",
-					self->category[i].maxMsgSize, self->category[i].logSize, self->category[i].fileName);
+			Error("Maximum message size (%d) exceeds 1/4 of log size (%lld) for \"%s\"",
+				self->category[i].maxMsgSize, self->category[i].logSize, self->category[i].fileName);
 			return false;
 		}
 		if (self->category[i].maxMsgSize > 1024*1024) {
-			if (self->verbose >= 0)
-				fprintf(stderr, "WARNING: Max message size of %d will cause circulog to allocate an inconveniently large buffer."
-					"  Carefully consider whether you really want to allow messages this large.\n", self->category[i].maxMsgSize);
+			Warn("Max message size of %d will cause circulog to allocate an inconveniently large buffer."
+				"  Carefully consider whether you really want to allow messages this large.", self->category[i].maxMsgSize);
 		}
 	}
 	return true;
 }
 
 bool ccl_openLogFiles(circulog_t* self) {
-	int i, err;
-	struct stat info;
-	off_t ofs; // 64-bit, with #define at top of this file
+	retention_category_t *c;
 	
-	for (i=0; i<self->categoryCount; i++) {
-		self->category[i].log= ccl_open(self->category[i].fileName, false, &err);
-		if (!self->category[i].log) {
-			// failed to open the file.  See if the reason was that it didn't exist...
-			if (errno == ENOENT && self->createIfMissing) {
-				if (!ccl_createLogFile(self, self->category+i))
+	for (c= self->category; c < self->category+self->categoryCount; c++) {
+		c->log= ccl_new();
+		if (!c->log) {
+			Error("malloc: %m");
+			return false;
+		}
+		c->log->access= CCL_WRITE;
+		c->log->max_message_size= c->maxMsgSize;
+		if (ccl_open(c->log, c->fileName)) {
+			// successfully opened, but check if the size is ok
+			if (c->log->size < c->logSize) {
+				if (c->resizeLog) {
+					if (!ccl_resize(c->log, c->fileName, c->logSize, false, false)) {
+						char buf[256];
+						Error("Failed to resize \"%s\": %s", c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
+						return false;
+					}
+				}
+				else if (c->maxMsgSize > (c->log->size >> 2)) {
+					Error("Actual log size of \"%s\" is %lld, which is less than 4x the max message size (%d)",
+						c->fileName, c->log->size, c->maxMsgSize);
 					return false;
+				}
+				else {
+					Notice("Actual log size of \"%s\" is smaller than requested \"%lld\"", c->fileName, c->log->size);
+				}
+			}
+		}
+		else {
+			// failed to open the file.  See if the reason was that it didn't exist...
+			if (c->log->last_err == CCL_ELOGOPEN && c->log->last_errno == ENOENT && self->createIfMissing) {
+				if (!ccl_resize(c->log, c->fileName, c->logSize, true, false)) {
+					char buf[256];
+					Error("Failed to create \"%s\": %s", c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
+					return false;
+				}
 			}
 			else {
 				char buf[256];
-				snprintf(buf, sizeof(buf), "open(%s)", self->category[i].fileName);
+				snprintf(buf, sizeof(buf), "open(%s)", c->fileName);
 				perror(buf);
 				return false;
-			}
-		}
-		
-		// check if the size is ok
-		if (self->category[i].log->size < self->category[i].logSize) {
-			if (self->category[i].resizeLog) {
-				
-				if (!ccl_resizeLogFile(self, self->category+i))
-					return false;
-			} else {
-				if (self->category[i].maxMsgSize > (ofs>>2)) {
-					fprintf(stderr, "ERROR: Actual log size of \"%s\" is %lld, which is less than 4x the max message size (%d)\n",
-						self->category[i].fileName, ofs, self->category[i].maxMsgSize);
-					return false;
-				}
-				else if (self->verbose >= 1) {
-					fprintf(stderr, "NOTICE: Actual log size of \"%s\" is smaller than requested \"%lld\"\n",
-						self->category[i].fileName, self->category[i].logSize);
-				}
 			}
 		}
 	}
@@ -309,22 +319,23 @@ bool ccl_openLogFiles(circulog_t* self) {
 }
 
 bool ccl_handleMessage(circulog_t* self, const char* msg, int msgLen) {
-	ccl_message_into_t msg;
+	ccl_message_info_t msgi;
+	ccl_log_t *log= NULL;
 	
 	// TODO: figure out which log it belongs to
 	
-	msg.timestamp= 0; // ask lib to run clock_gettime
-	msg.msglen= msgLen;
-	msg.data_ofs= 0;
-	msg.data_len= msgLen;
-	msg.data= (void*) msg;
-	ccl_write_message(&msg);
+	msgi.timestamp= 0; // ask lib to run clock_gettime
+	msgi.msglen= msgLen;
+	msgi.data_ofs= 0;
+	msgi.data_len= msgLen;
+	msgi.data= (void*) msg;
+	ccl_write_message(log, &msgi);
 	return false;
 }
 
 bool ccl_parseOptions(circulog_t* self, char** argv) {
 	bool endOptions= false;
-	char *bundle, *opt, *optval, *endptr;
+	char *bundle, *opt, *optval;
 	while (*argv) {
 		if (!endOptions && argv[0][0] == '-') {
 			optval= NULL;
@@ -391,12 +402,9 @@ static bool reportInvalid(const char *name, const char* value) {
 }
 
 bool ccl_processOption(circulog_t *self, char shortOpt, char* longOpt, char* optVal, char*** argvp) {
-	int i, count;
-	char **array, **item;
 	char buf[2]= { shortOpt, '\0' };
 	char *name= longOpt? longOpt : buf;
 	long long size;
-	bool parsed;
 	
 	#define BEGINMATCH if (0) {
 	#define CASE(short,long,wantval) } else if (shortOpt == short || (longOpt && strcmp(longOpt, long)==0)) { if (!checkVal(name,wantval,&optVal,argvp)) return false;
@@ -463,8 +471,8 @@ bool ccl_processOption(circulog_t *self, char shortOpt, char* longOpt, char* opt
 	
 	ENDMATCH
 	
-	// If we didn't return true, it means optVal is invalid.
-	// (ENDMATCH reports invalid option names)
+	// ENDMATCH reports invalid option names, so if we get here, all was good.
+	return true;
 }
 
 bool parseInt(long* dest, char* src) {
@@ -513,7 +521,6 @@ void exit_version() {
 }
 
 void exit_usage(int stream, int exitcode) {
-	int i;
 	fprintf(stream==1? stdout:stderr,
 		"circulog version %d.%d.%d\n\n"
 		"Usage: circulog [options] [LOG_NAME [options], ...]\n"
