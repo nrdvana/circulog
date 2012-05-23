@@ -4,6 +4,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <assert.h>
+#include <endian.h>
 
 inline int64_t endian_swap_32(int32_t x) {
 	union {
@@ -68,7 +69,7 @@ int main(int argc, char **argv) {
 	
 	int n= atoi(argv[1]);
 	int x= 0;
-	int y= 0;
+	int64_t y= 0;
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (i= 0; i < n; i++)
 		x+= endian_swap_32(i);
@@ -80,6 +81,12 @@ int main(int argc, char **argv) {
 		x+= endian_swap_32_2(i);
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	print_diff("endian_swap_32_2", i, &start, &end);
+	
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (i= 0; i < n; i++)
+		x+= htobe32(i);
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	print_diff("htobe32", i, &start, &end);
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
 	for (i= 0; i < n; i++)
@@ -92,6 +99,12 @@ int main(int argc, char **argv) {
 		y+= endian_swap_64_2(i);
 	clock_gettime(CLOCK_MONOTONIC, &end);
 	print_diff("endian_swap_64_2", i, &start, &end);
+	
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	for (i= 0; i < n; i++)
+		y+= htobe64(i);
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	print_diff("htobe64", i, &start, &end);
 	
 	// ensure values are used, to keep things form getting optimized out
 	return x ^ (int)y;
