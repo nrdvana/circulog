@@ -371,7 +371,6 @@ bool ccl_handleMessage(circulog_t* self, const char* msg, int msgLen) {
 		if (!ccl_write_message(c->log, &msgi)) {
 			char buf[256];
 			Error("Failed to write message \"%.*s\" to \"%s\": %s", msgLen, msg, c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
-			fprintf(stderr, "foo\n");
 			return false;
 		}
 	} else {

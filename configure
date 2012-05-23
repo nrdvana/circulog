@@ -34,6 +34,16 @@ echo "Makefile created at $buildroot";
 	
 	echo "#include <sys/mman.h>"
 	echo "#include <sys/types.h>"
+	
+	echo "#ifndef _BSD_SOURCE"
+	echo "#define _BSD_SOURCE"
+	echo "#endif"
+	echo "#include <endian.h>"
+	
+	# echo "include <sys/endian.h>"
+	
+	#echo "#include \"custom_endian.h\""
+	
 	echo "#include <errno.h>"
 	echo "#include <fcntl.h>"
 	echo "#include <time.h>"
