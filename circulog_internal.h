@@ -14,12 +14,10 @@ typedef struct {
 	int64_t
 		size,
 		header_size,
-		oldest,
-		newest,
-		writer_pid;
+		block_size;
 } ccl_log_header_t;
 
-#define CCL_HEADER_MAGIC 0x43697263754c6f67LL
+#define CCL_HEADER_MAGIC 0x676f4c7563726943LL
 #define CCL_CURRENT_VERSION 0x00000000
 
 typedef struct {

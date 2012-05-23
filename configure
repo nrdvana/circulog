@@ -27,16 +27,10 @@ cat "$buildroot/config.mk" "$srcroot/Makefile.mlc" >"$buildroot/Makefile"
 echo "Makefile created at $buildroot";
 
 {
-	echo "#define _FILE_OFFSET_BITS 64";
-	
-	echo "// For now, we require PCRE.  I'd like to make it optional in the future."
-	echo "#define CONFIG_PCRE";
-	
-	echo "#ifdef CONFIG_PCRE"
-	echo "#include <pcre.h>"
-	echo "#endif"
-	
-	echo "#define POSIX_STRERROR";
+	echo "#define _FILE_OFFSET_BITS 64"
+	echo "#define POSIX_STRERROR"
+	#echo "#define NDEBUG"
+	echo "#include <assert.h>"
 	
 	echo "#include <sys/mman.h>"
 	echo "#include <sys/types.h>"
@@ -46,6 +40,11 @@ echo "Makefile created at $buildroot";
 	echo "#include <string.h>"
 	echo "#include <unistd.h>"
 	echo "#include <stdio.h>"
+
+	echo "// For now, we require PCRE.  I'd like to make it optional in the future."
+	echo "#define CONFIG_PCRE"
+	echo "#include <pcre.h>"
+	
 } > "$buildroot/config.h"
 
 echo "Created config.h"

@@ -13,10 +13,12 @@ typedef struct {
 	int maxMsgSize;
 	bool resizeLog;
 	ccl_log_t *log;
+	int patternCount;
 } retention_category_t;
 
 #ifdef CONFIG_PCRE
 typedef struct {
+	const char* spec;
 	pcre* pattern;
 	pcre_extra* studyData;
 	const char* replace;
@@ -61,41 +63,54 @@ void exit_usage(int stream, int exitcode);
 void exit_version();
 void exit_runtime_fail();
 
+#define Error(fmt, args...)  do { if (self->verbose >= -1) fprintf(stderr, "ERROR: "   fmt "\n" , ## args); } while (0)
+#define Warn(fmt, args...)   do { if (self->verbose >=  0) fprintf(stderr, "WARNING: " fmt "\n" , ## args); } while (0)
+#define Notice(fmt, args...) do { if (self->verbose >=  1) fprintf(stderr, "NOTICE: "  fmt "\n" , ## args); } while (0)
+#define Debug(fmt, args...)  do { if (self->verbose >=  2) fprintf(stderr, "DEBUG: "   fmt "\n" , ## args); } while (0)
+#define Trace(fmt, args...)  do { if (self->verbose >=  3) fprintf(stderr, "DEBUG: "   fmt "\n" , ## args); } while (0)
+
 int main(int argc, char** argv) {
 	char *buffer, *start, *limit, *eol;
 	int i, got, bufLen;
 	bool eof, skipCurrent;
-	circulog_t self;
+	circulog_t circulog, *self= &circulog;
 	
-	memset(&self, 0, sizeof(self));
-	self.defaultMaxMsgSize= CCL_DEFAULT_MAX_MESSAGE_SIZE;
-	self.defaultLogSize= CCL_DEFAULT_LOG_SIZE;
-	self.createIfMissing= true;
+	memset(self, 0, sizeof(*self));
+	self->defaultMaxMsgSize= CCL_DEFAULT_MAX_MESSAGE_SIZE;
+	self->defaultLogSize= CCL_DEFAULT_LOG_SIZE;
+	self->createIfMissing= true;
 	
-	if (!ccl_parseOptions(&self, argv+1))
+	if (!ccl_parseOptions(self, argv+1)) {
+		Debug("option-parsing failed");
 		exit_usage(2, 2);
+	}
 	
-	if (!ccl_sanityCheck(&self)) {
-		fprintf(stderr, "ERROR: Configuration is invalid, exiting\n");
+	Debug("sanity check");
+	if (!ccl_sanityCheck(self)) {
+		Debug("sanity check failed");
+		Error("Configuration is invalid (fatal)");
 		return 2;
 	}
 	
-	if (!ccl_openLogFiles(&self)) {
+	Debug("open logs");
+	if (!ccl_openLogFiles(self)) {
 		exit_runtime_fail();
 	}
 	
 	bufLen= 0;
-	for (i= 0; i < self.categoryCount; i++)
-		if (self.category[i].maxMsgSize > bufLen)
-			bufLen= self.category[i].maxMsgSize+1;
+	for (i= 0; i < self->categoryCount; i++)
+		if (self->category[i].maxMsgSize > bufLen)
+			bufLen= self->category[i].maxMsgSize+1;
 	buffer= malloc(bufLen);
 	if (!buffer) {
-		perror("malloc(msgbuf)");
+		Error("malloc(msgbuf): %m");
 		exit_runtime_fail();
 	}
 	
 	start= limit= buffer;
 	skipCurrent= false;
+	eof= false;
+	Debug("beginning main loop");
 	while (!eof) {
 		got= read(0, limit, bufLen-1 - (limit-buffer));
 		if (got > 0) {
@@ -109,7 +124,8 @@ int main(int argc, char** argv) {
 					skipCurrent= false;
 				else {
 					*eol= '\0';
-					ccl_handleMessage(&self, start, eol-start);
+					Debug("handle message");
+					ccl_handleMessage(self, start, eol-start);
 				}
 				// reset pointers for next search
 				start= eol+1;
@@ -124,35 +140,31 @@ int main(int argc, char** argv) {
 			}
 			// check for full buffer
 			if (limit - buffer >= bufLen) {
-				fprintf(stderr, "ERROR: Message exceeds maximum length.  Processing first %d bytes...\n", limit-buffer);
+				Error("Message exceeds maximum length.  Processing first %d bytes...\n", limit-buffer);
 				// already NUL terminated
-				ccl_handleMessage(&self, buffer, limit-buffer);
+				ccl_handleMessage(self, buffer, limit-buffer);
 				skipCurrent= true;
 				limit= start= buffer;
 			}
 		} else if (got == 0) {
+			Debug("reached eof");
 			if (limit > buffer) {
-				fprintf(stderr, "WARN: Partial message (%d bytes) received before EOF.  Processing fragment as message...\n", limit-buffer);
+				Warn("Partial message (%d bytes) received before EOF.  Processing fragment as message...\n", limit-buffer);
 				// already NUL terminated
-				ccl_handleMessage(&self, buffer, limit-buffer);
+				ccl_handleMessage(self, buffer, limit-buffer);
 				limit= buffer;
 			}
 			eof= true;
-		} else if (errno == EAGAIN || errno == EINTR) {
+		} else if (errno == EINTR) {
 			// continue
 		} else {
-			perror("read(stdin)");
+			Error("read(stdin): %m");
 			exit_runtime_fail();
 		}
 	}
-	
+	Debug("exiting gracefully");
 	return 0;
 }
-
-#define Error(fmt, args...)  do { if (self->verbose < -1) fprintf(stderr, "ERROR: "   fmt "\n" , ## args); } while (0)
-#define Warn(fmt, args...)   do { if (self->verbose < 0)  fprintf(stderr, "WARNING: " fmt "\n" , ## args); } while (0)
-#define Notice(fmt, args...) do { if (self->verbose < 1)  fprintf(stderr, "NOTICE: "  fmt "\n" , ## args); } while (0)
-#define Debug(fmt, args...)  do { if (self->verbose < 2)  fprintf(stderr, "DEBUG: "   fmt "\n" , ## args); } while (0)
 
 bool ccl_addLogSpec(circulog_t* self, const char* suffix) {
 	char name[256];
@@ -221,6 +233,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 	memset(self->pattern+self->patternCount, 0, sizeof(self->pattern[0]));
 	
 	retention_pattern_t *pat= self->pattern+self->patternCount;
+	pat->spec= spec;
 	pat->pattern= pcre_compile(spec, 0, &errmsg, &errofs, NULL);
 	if (!pat->pattern) {
 		// Failed to compile.  Display a helpful syntax error.
@@ -240,6 +253,7 @@ bool ccl_addPatternSpec(circulog_t* self, const char* spec) {
 	}
 	pat->replace= NULL; // not supported yet
 	pat->destLogIdx= self->currentCategory - self->category;
+	self->currentCategory->patternCount++;
 	self->patternCount++;
 	return true;
 }
@@ -278,10 +292,12 @@ bool ccl_openLogFiles(circulog_t* self) {
 		}
 		c->log->access= CCL_WRITE;
 		c->log->max_message_size= c->maxMsgSize;
+		Debug("Opening %s", c->fileName);
 		if (ccl_open(c->log, c->fileName)) {
 			// successfully opened, but check if the size is ok
 			if (c->log->size < c->logSize) {
 				if (c->resizeLog) {
+					Notice("Resizing %s to %lld", c->fileName, c->logSize);
 					if (!ccl_resize(c->log, c->fileName, c->logSize, false, false)) {
 						char buf[256];
 						Error("Failed to resize \"%s\": %s", c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
@@ -301,6 +317,7 @@ bool ccl_openLogFiles(circulog_t* self) {
 		else {
 			// failed to open the file.  See if the reason was that it didn't exist...
 			if (c->log->last_err == CCL_ELOGOPEN && c->log->last_errno == ENOENT && self->createIfMissing) {
+				Notice("Creating missing %s", c->fileName);
 				if (!ccl_resize(c->log, c->fileName, c->logSize, true, false)) {
 					char buf[256];
 					Error("Failed to create \"%s\": %s", c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
@@ -309,8 +326,7 @@ bool ccl_openLogFiles(circulog_t* self) {
 			}
 			else {
 				char buf[256];
-				snprintf(buf, sizeof(buf), "open(%s)", c->fileName);
-				perror(buf);
+				Error("open %s: %s", c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
 				return false;
 			}
 		}
@@ -319,18 +335,49 @@ bool ccl_openLogFiles(circulog_t* self) {
 }
 
 bool ccl_handleMessage(circulog_t* self, const char* msg, int msgLen) {
+	int ret;
 	ccl_message_info_t msgi;
-	ccl_log_t *log= NULL;
+	retention_pattern_t *p;
+	retention_category_t *c= NULL, *catchall= &self->category[self->categoryCount-1];
+	int ovector[20*3];
 	
-	// TODO: figure out which log it belongs to
+	// We discard messages unless there is a log specified with no pattern requirements
+	if (catchall->patternCount) catchall= NULL;
 	
-	msgi.timestamp= 0; // ask lib to run clock_gettime
-	msgi.msglen= msgLen;
-	msgi.data_ofs= 0;
-	msgi.data_len= msgLen;
-	msgi.data= (void*) msg;
-	ccl_write_message(log, &msgi);
-	return false;
+	if (self->patternCount) {
+		for (p= self->pattern; p < self->pattern+self->patternCount; p++) {
+			Trace("Matching vs %s", p->spec);
+			ret= pcre_exec(p->pattern, p->studyData, msg, msgLen, 0, 0, ovector, sizeof(ovector)/sizeof(*ovector));
+			if (ret >= 0) {
+				c= self->category + p->destLogIdx;
+				break;
+			} else if (ret < -1) {
+				Warn("Failed matching \"%s\" to \"%.*s\": %d (see man pcreapi)", p->spec, msgLen, msg, ret);
+			}
+		}
+		if (!c) c= catchall;
+	}
+	else
+		c= catchall;
+	
+	// If we matched a category, we write it, else discard it.
+	if (c) {
+		msgi.sizeof_struct= sizeof(msgi);
+		msgi.timestamp= 0; // ask lib to run clock_gettime
+		msgi.msg_len= msgLen;
+		msgi.data_ofs= 0;
+		msgi.data_len= msgLen;
+		msgi.data= (void*) msg;
+		if (!ccl_write_message(c->log, &msgi)) {
+			char buf[256];
+			Error("Failed to write message \"%.*s\" to \"%s\": %s", msgLen, msg, c->fileName, ccl_err_text(c->log, buf, sizeof(buf)));
+			fprintf(stderr, "foo\n");
+			return false;
+		}
+	} else {
+		Debug("Discarding message \"%.*s\"", msgLen, msg);
+	}
+	return true;
 }
 
 bool ccl_parseOptions(circulog_t* self, char** argv) {
