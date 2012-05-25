@@ -35,7 +35,10 @@ void ccl_init(ccl_log_t *log, int struct_size) {
 	memset(log, 0, struct_size);
 	log->sizeof_struct= struct_size;
 	log->fd= -1;
-	log->max_message_size= CCL_DEFAULT_MAX_MESSAGE_SIZE;
+	log->size=                CCL_DEFAULT_LOG_SIZE;
+	log->block_size=          CCL_DEFAULT_BLOCK_SIZE;
+	log->max_message_size=    CCL_DEFAULT_MAX_MESSAGE_SIZE;
+	log->timestamp_precision= CCL_DEFAULT_TIMESTAMP_PRECISION;
 }
 
 bool ccl_destroy(ccl_log_t *log) {
@@ -166,7 +169,9 @@ static bool unlock_log(ccl_log_t *log) {
 	return true;
 }
 
-int coerce_block_size(int64_t sz) {
+inline int coerce_block_size(int64_t sz) {
+	// 16 is the smallest possible block size, since every block contains a int64
+	// Block size of 16 is ridiculous, but useful for library validation
 	if (sz < 16) return CCL_DEFAULT_BLOCK_SIZE;
 	
 	// http://graphics.stanford.edu/~seander/bithacks.html#RoundUpPowerOf2
@@ -180,7 +185,8 @@ int coerce_block_size(int64_t sz) {
 	return sz;
 }
 
-int coerce_log_size(int64_t sz, int64_t block_size) {
+inline int coerce_log_size(int64_t sz, int64_t block_size) {
+	// round up to the next multiple of block_size
 	return (sz + block_size - 1) & ~(block_size-1);
 }
 
@@ -240,10 +246,11 @@ bool ccl_open(ccl_log_t *log, const char *path) {
 		//log->wrong_endian= true;
 	}
 	
+	log->version=     le32toh(header.version);
 	log->size=        le64toh(header.size);
 	log->header_size= le64toh(header.header_size);
-	log->block_size=  le64toh(header.block_size);
-	log->version=     le32toh(header.version);
+	log->block_size=  le32toh(header.block_size);
+	log->timestamp_precision= le32toh(header.timestamp_precision);
 	
 	// version check
 	if (le32toh(header.oldest_compat_version) > CCL_CURRENT_VERSION) {
@@ -279,7 +286,7 @@ bool ccl_open(ccl_log_t *log, const char *path) {
 	return true;
 }
 
-bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, bool force) {
+bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, bool force) {
 	ccl_log_t newLog;
 	ccl_log_header_t header;
 	bool haveOld= false;
@@ -321,8 +328,9 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, 
 	
 	ccl_init(&newLog, sizeof(newLog));
 	newLog.block_size= coerce_block_size(log->block_size);
-	newLog.size= coerce_log_size(logSize, newLog.block_size);
+	newLog.size= coerce_log_size(newSize, newLog.block_size);
 	newLog.header_size= sizeof(header);
+	newLog.timestamp_precision= log->timestamp_precision;
 	newLog.version= CCL_CURRENT_VERSION;
 	newLog.max_message_size= (haveOld? log->max_message_size : CCL_DEFAULT_MAX_MESSAGE_SIZE);
 	newLog.access= CCL_WRITE;
@@ -349,6 +357,7 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, 
 	header.size= newLog.size;
 	header.header_size= newLog.header_size;
 	header.block_size= newLog.block_size;
+	header.timestamp_precision= newLog.timestamp_precision;
 	
 	if (!write_rec(newLog.fd, &header, header.header_size)) {
 		log->last_err= CCL_ERESIZECREATE;
@@ -385,8 +394,8 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, 
 	log->block_size=  newLog.block_size;
 	log->version= newLog.version;
 	// log->max_message_size remains the same
-	log->wrong_endian= newLog.wrong_endian;
-	log->dirty= newLog.dirty;
+	// log->wrong_endian= newLog.wrong_endian;
+	// log->dirty= newLog.dirty;
 	log->access= newLog.access;
 	log->fd= newLog.fd;
 	log->file_pos= newLog.file_pos;
@@ -397,25 +406,6 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t logSize, bool create, 
 	
 	// All done!
 	return true;
-}
-
-int64_t ccl_get_timestamp(struct timespec *t) {
-	#ifdef _POSIX_TIMERS
-	struct timespec t2;
-	if (!t) {
-		t= &t2;
-		if (clock_gettime(CLOCK_REALTIME, &t2) < 0)
-			return 0LL;
-	}
-	#else
-	if (!t) return ((int64_t) time(NULL)) << 16;
-	#endif
-	return (((int64_t) t->tv_sec) << 16) + CCL_NSEC_TO_16BIT_FRAC(t->tv_nsec);
-}
-
-void ccl_split_timestamp(int64_t ts, struct timespec *t_out) {
-	t_out->tv_nsec= CCL_16BIT_FRAC_TO_NSEC(ts & 0xFFFFLL);
-	t_out->tv_sec=  (time_t) (ts >> 16);
 }
 
 int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value) {
@@ -489,12 +479,99 @@ inline int decode_size(uint64_t *value, uint64_t encoded) {
 	return 1;
 }
 
+bool buffered_write(ccl_log_t *log, char *data, int count, bool flush) {
+	int n;
+	int64_t block_avail= ((log->file_pos + log->buffer_pos) & (log->block_size - 1)) - 8;
+	char* buf= log->buffer;
+	int buf_avail= log->buffer_size - log->buffer_pos;
+	bool commit= false, done= false;
+	while (!done) {
+		assert((log->file_pos & 7) == 0);
+		assert(block_avail >= 0);
+		assert(buf_avail >= 0);
+		
+		// buffer full, need to flush
+		if (buf_avail == 0)
+			commit= true;
+		// time to write block-end-marker?
+		else if (block_avail == 0) {
+			// everything is 8-aligned, so if we have any buffer available, we have 8 bytes.
+			assert(buf_avail >= 8);
+			
+			*(int64_t*)(log->buffer+log->buffer_pos)= log->msg_start_addr;
+			log->buffer_pos+= 8;
+			buf_avail-= 8;
+			block_avail= log->block_size - 8;
+			// if we're at EOF, we need to flush the buffer
+			if (log->file_pos + log->buffer_pos == log->size)
+				commit= true;
+		}
+		// more data to add?
+		else if (count) {
+			// n = min( count, buf_avail, block_avail )
+			n= (buf_avail < block_avail)? buf_avail : (int)block_avail;
+			if (count < n)
+				n= count;
+			
+			assert(n > 0);
+			// Optimization: if there's a bunch of data to write, and we have
+			//  nothing buffered, just write directly from 'data'.
+			if (log->buffer_pos == 0 && n > log->buffer_size) {
+				buf= data;
+				// but, must still be a multiple of 8.
+				n= n & ~0x7;
+				commit= true;
+			}
+			else {
+				memcpy(log->buffer+log->buffer_pos, data, n);
+			}
+			log->buffer_pos+= n;
+			buf_avail-= n;
+			block_avail-= n;
+			data+= n;
+			count-= n;
+		}
+		// else we're done
+		else {
+			// is this the end of a mesage?
+			if (flush && log->buffer_pos > 0)
+				commit= true;
+			done= true;
+		}
+		
+		if (commit) {
+			commit= false;
+			// Write the buffer if it is full or we're at EOF or 'flush' was requested
+			// Incedentally, all those cases require there to be a multiple of 8 bytes in the buffer.
+			assert((log->buffer_pos & 7) == 0);
+			if (!write_rec(log->fd, buf, log->buffer_pos)) {
+				log->last_err= CCL_ELOGWRITE;
+				log->last_errno= errno;
+				// if we were trying our direct-from-data optimization, we need to clean up buffer_pos
+				if (buf != log->buffer)
+					log->buffer_pos= 0;
+				return false;
+			}
+			buf= log->buffer; // restore buf pointer (might have been switched to 'data')
+			log->file_pos += log->buffer_pos;
+			log->buffer_pos= 0;
+			buf_avail= log->buffer_size;
+			// wrap at EOF
+			if (log->file_pos >= log->size) {
+				assert(log->file_pos == log->size);
+				log->file_pos= log->header_size;
+				block_avail= (log->file_pos & (log->block_size - 1)) - 8;
+			}
+		}
+	}
+	return true;
+}
+
 bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
-	int64_t addr, msg_start_addr, next_block, msg_end;
-	int msg_data_pos, size_bytes, avail, count;
-	uint64_t encoded_size;
-	bool wrote_ts, wrote_size, success, done;
-	uint8_t* bufpos;
+	uint64_t encoded_size= 0;
+	int size_bytes, padding, count;
+	// leave room for padding(max=7), reverse_count(max=8), timestamp(8), checksum(8)
+	uint64_t suffix[4];
 	
 	if (!(msg
 		&& msg->sizeof_struct == sizeof(*msg)
@@ -521,7 +598,8 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 	}
 	
 	// If writing a new message, the file pointer should be on a multiple of 8
-	if (!(log->file_pos >= log->header_size
+	if (!((log->size & 7) == 0
+		&& log->file_pos >= log->header_size
 		&& log->file_pos <= log->size
 		&& (msg->data_ofs || (log->file_pos & 0x7) == 0)
 	)) {
@@ -536,11 +614,19 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 		log->last_errno= 0;
 		return false;
 	}
+	// TODO: add support for shared write-access
+	if (log->access == CCL_SHARE) {
+		log->last_err= CCL_ESYSERR;
+		log->last_errno= 0;
+		return false;
+	}
 	
 	// make sure we have a write-buffer
 	if (!log->buffer) {
 		if (!log->buffer_size)
-			log->buffer_size= 8*1024;
+			log->buffer_size= 8*1024; // TODO: make this reflect the max-message-size, a bit.
+		if (log->buffer_size < 256)
+			log->buffer_size= 256;
 		if (!(log->buffer= malloc(log->buffer_size))) {
 			log->last_err= CCL_ESYSERR;
 			log->last_errno= errno;
@@ -550,19 +636,12 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 	
 	// Fill in the timestamp with "now()" if not specified by the user
 	if (msg->timestamp == 0) {
-		msg->timestamp= ccl_get_timestamp(NULL);
+		msg->timestamp= ccl_encode_timestamp(log, NULL);
 		if (msg->timestamp == 0) {
 			log->last_err= CCL_ESYSERR;
 			log->last_errno= errno;
 			return false;
 		}
-	}
-	
-	if (log->access == CCL_SHARE) {
-		// not supported yet
-		log->last_err= CCL_ESYSERR;
-		log->last_errno= 0;
-		return false;
 	}
 	
 	/*
@@ -575,187 +654,50 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 	 *   - 0 < msg->data_ofs == log->msg_ofs < log->msg_len == msg->msg_len
 	 *   - log->file_pos is in a valid position (which we assume is the middle of the previous message's data)
 	 */
-	addr= log->file_pos;
-	msg_start_addr= msg->data_ofs == 0? addr : log->msg_start_addr;
-	next_block= ((addr + log->block_size - 1) & ~((int64_t)log->block_size-1));
-	msg_data_pos= 0;
-	wrote_ts= msg->data_ofs != 0;
-	wrote_size= msg->data_ofs != 0;
+	
 	size_bytes= encode_size(&encoded_size, msg->msg_len);
-	assert((log->size & 7) == 0);
-	success= true;
-	done= false;
-	while (!done) {
-		bufpos= (uint8_t*) log->buffer;
-		do { /* fill buffer as much as possible */
-			// Step 1: loop at the end of the log
-			assert(addr <= next_block-8);
-			if (addr >= log->size) {
-				assert(addr == log->size);
-				if (lseek(log->fd, log->header_size, SEEK_SET) < 0) {
-					success= false;
-					break;
-				}
-				if (msg_start_addr == addr)
-					msg_start_addr= log->header_size;
-				addr= log->header_size;
-				next_block= ((addr + log->block_size - 1) & ~((int64_t)log->block_size-1));
-				if (bufpos != log->buffer)
-					break; // done flling buffer, since we will have to do another 'write' anyway
-			}
-			
-			avail= log->buffer_size - (bufpos - (uint8_t*) log->buffer);
-			
-			// Step 2: write the block's current-message-addr if we're at the end of the block
-			assert(addr <= next_block-8);
-			if (addr == next_block-8) {
-				if (avail < 8)
-					break; // no room for the block-address, so we'll do it next time around
-				// append message_start_addr to buffer
-				*((int64_t*)(bufpos))= htole64(msg_start_addr);
-				bufpos+= 8;
-				addr+= 8;
-				avail-= 8;
-				next_block+= log->block_size;
-			}
-			
-			// Step 3: we're in a safe state to start writing bytes of the message
-			// Figure how many continuous bytes we can write, and constrain 'avail'
-			assert(addr <= next_block-8);
-			if (next_block - 8 - addr < avail)
-				avail= (int)(next_block - 8 - addr);
-			if (log->size - addr < avail)
-				avail= (int)(log->size - addr);
-			
-			// If we're out of space here, it's because of a full buffer or EOF.
-			// Either requires us to flush the buffer.
-			if (avail == 0)
-				break;
-			
-			// Step 4: write the timestamp, if this is the start of a message and we haven't written it yet
-			assert(addr <= next_block-8);
-			if (!wrote_ts) {
-				if (avail < 8)
-					break; // we have to stop here, until we can get the whole timestamp written
-				assert((addr & 7) == 0);
-				*(int64_t*)(bufpos)= htole64(msg->timestamp);
-				bufpos+= 8;
-				addr+= 8;
-				avail-= 8;
-				wrote_ts= true;
-				if (avail == 0) continue; // go back and check for EOF and end-of-block
-			}
-			
-			// Step 5: write the message size as a byte-encoding similar to UTF-8
-			//   We have some space available, but if the buffer is too full to do
-			//   it in one shot, we break out of the loop to flush it and start over.
-			assert(avail > 0);
-			if (!wrote_size) {
-				assert((addr & 7) == 0);
-				// really, this should never happen, since we just started the message and the buffer should be mostly empty.
-				// but, some day we might try to buffer multiple messages per write
-				if (avail < 8)
-					break;
-				*((int64_t*)bufpos)= htole64(encoded_size);
-				bufpos += size_bytes;
-				addr += size_bytes;
-				avail -= size_bytes;
-				wrote_size= true;
-				if (avail == 0) continue; // go back and check for EOF and end-of-block
-			}
-			
-			// Step 6: write some or all of the actual data
-			//   We keep track of how much we've written in the 'msg_data_pos' var.
-			assert(avail > 0);
-			if (msg_data_pos < msg->data_len) {
-				count= msg->data_len - msg_data_pos;
-				if (avail < count) count= avail;
-				memcpy(bufpos, ((char*)msg->data)+msg_data_pos, count);
-				bufpos += count;
-				addr += count;
-				avail -= count;
-				msg_data_pos+= count;
-				if (avail == 0) continue;
-			}
-			
-			// Step 7: If we have the end of the data, we write some padding and the end-count
-			//  If we've exhausted the supplied data but it isn't the msg_len, then the caller
-			//    will call us again with more data so we're done for now.
-			assert(avail > 0);
-			if (msg->data_ofs + msg->data_len == msg->msg_len) {
-				// round up to the next boundary
-				msg_end= (addr+7LL) & ~7LL;
-				count= msg_end - addr;
-				if (avail < count)
-					// go get a fresh buffer
-					break;
-				
-				// Is the space between the end of the string large enough to accomodate the count?
-				if (count >= size_bytes) {
-					encoded_size= htobe64(encoded_size);
-					memcpy(bufpos, ((char*)&encoded_size)+8-count, count);
-					addr  += count;
-					bufpos+= count;
-					avail -= count;
-					// done
-				}
-				else {
-					// else we fill up to the boundary with 0 and the count goes in its own 8 bytes
-					if (count > 0) {
-						memset(bufpos, 0, count);
-						addr  += count;
-						bufpos+= count;
-						avail -= count;
-						if (avail == 0) continue;  // might be a block boundary or EOF
-					}
-					// count gets its own 8 bytes, if we have room.
-					assert((addr & 7) == 0);
-					if (avail < 8) break; // full buffer
-					
-					// the encoded_size is padded with 0, so it works out.
-					*((int64_t*)bufpos)= htobe64(encoded_size);
-					addr  += 8;
-					bufpos+= 8;
-					avail -= 8;
-					// done
-				}
-			}
-			
-			done= true;
-		} while (false); // all looping is performed with 'continue'
+	
+	// starting a new message?
+	if (log->msg_pos == 0) {
+		log->msg_start_addr= log->file_pos;
+		log->msg_len= msg->msg_len;
 		
-		// Now, we write the buffer to the file.
-		if (success) {
-			count= bufpos - (uint8_t*) log->buffer;
-			assert(count > 0);
-			success= write_rec(log->fd, log->buffer, count);
-		}
-		if (!success)
-			done= true;
+		// The buffer is empty, and size is greater than 8, so just write it directly
+		assert(log->buffer_pos == 0);
+		assert(log->buffer_size >= 8);
+		assert(log->file_pos <= (((log->file_pos + log->block_size - 1) & ~(log->block_size-1)) - 16));
+		assert(log->file_pos < log->size);
+		*((int64_t*) log->buffer)= htole64(encoded_size);
+		log->buffer_pos= size_bytes;
 	}
-	if (!success) {
-		// write failed, (or seek failed)
-		log->last_err= CCL_ELOGWRITE;
-		log->last_errno= errno;
-		// and we try to restore everything to the exact state it was before the call
-		lseek(log->fd, log->file_pos, SEEK_SET);
-	}
-	else if (msg->data_ofs + msg->data_len == msg->msg_len) {
-		// message is complete
-		log->file_pos= addr;
-		log->msg_start_addr= 0;
+
+	// write the data
+	if (!buffered_write(log, msg->data, msg->data_len, false))
+		return false;
+	
+	// ending the message?
+	if (msg->data_ofs + msg->data_len == msg->msg_len) {
+		suffix[0]= 0; // possible padding for data
+		suffix[1]= htobe64(encoded_size);
+		suffix[2]= htole64(msg->timestamp);
+		suffix[3]= CCL_MESSAGE_CHECKSUM(msg->data_len, msg->timestamp, log->msg_start_addr);
+		
+		// The beginning of log->buffer is always 8-aligned, so we can calculate alignment
+		//  with buffer_pos instead of calculating the actual file address
+		padding= ((log->buffer_pos + 7) & ~7) - log->buffer_pos;
+		count= (padding >= size_bytes? padding + 16 : padding + 24);
+		if (!buffered_write(log, ((char*)(suffix+4)) - count, count, true))
+			return false;
+		
+		assert((log->buffer_pos & 7) == 0);
 		log->msg_pos= 0;
 		log->msg_len= 0;
 	}
 	else {
 		// to be continued by another call
-		if (log->msg_pos > 0)
-			log->msg_start_addr= log->file_pos;
-		log->file_pos= addr;
-		log->msg_pos += msg->data_len;
-		log->msg_len= msg->msg_len;
+		log->msg_pos+= msg->data_len;
 	}
-	return success;
+	return true;
 }
 
 ccl_message_info_t *ccl_read_message(ccl_log_t *log, int dataOfs, void *buf, int bufLen) {
