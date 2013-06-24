@@ -1,6 +1,11 @@
 #include "config.h"
 #include "circulog_internal.h"
 
+/**
+ Circulog File Format:
+
+*/
+
 static const char* errorTable[]= {
 	/* CCL_ESYSERR       */ "%m",
 	/* CCL_ELOGSTRUCT    */ "Log object is invalid",
@@ -52,6 +57,29 @@ bool ccl_destroy(ccl_log_t *log) {
 		log->fd= -1;
 	}
 	return !err;
+}
+
+uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t) {
+	#ifdef _POSIX_TIMERS
+	struct timespec t2;
+	if (!t) {
+		t= &t2;
+		if (clock_gettime(CLOCK_REALTIME, &t2) < 0)
+			return 0LL;
+	}
+	#else
+	if (!t) return ((uint64_t) time(NULL) - log->timestamp_epoch) << log->timestamp_precision;
+	#endif
+	return (((uint64_t) t->tv_sec - log->timestamp_epoch) << log->timestamp_precision) | (CCL_NSEC_TO_FRAC32(t->tv_nsec) >> (32-log->timestamp_precision));
+}
+
+void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out) {
+	t_out->tv_sec=  (time_t) ((ts >> log->timestamp_precision) + log->timestamp_epoch);
+	t_out->tv_nsec= CCL_FRAC32_TO_NSEC((ts >> (log->timestamp_precision-32)) & 0xFFFFFFFFLL);
+	if (t_out->tv_nsec == 1000000000) {
+		t_out->tv_sec= 1000000000;
+		t_out->tv_sec++;
+	}
 }
 
 const char* ccl_err_text(ccl_log_t *log, char* buf, int bufLen) {
@@ -222,19 +250,19 @@ bool ccl_open(ccl_log_t *log, const char *path) {
 	log->file_pos= 0;
 	
 	// we need at least sizeof(header)
-	if (fileSize < sizeof(ccl_log_header_t)) {
+	if (fileSize < CCL_MIN_HEADER_SIZE) {
 		log->last_err= CCL_ELOGINVAL;
 		log->last_errno= 0;
 		return false;
 	}
 	
-	// read it
-	if (!read_rec(log->fd, &header, sizeof(header))) {
+	// read basic fields
+	if (!read_rec(log->fd, &header, CCL_MIN_HEADER_SIZE)) {
 		log->last_err= CCL_ELOGREAD;
 		log->last_errno= errno;
 		return false;
 	}
-	log->file_pos+= sizeof(header);
+	log->file_pos= CCL_MIN_HEADER_SIZE;
 	
 	// check magic number, and determine endianness
 	if (header.magic != le64toh(CCL_HEADER_MAGIC)) {
@@ -258,20 +286,25 @@ bool ccl_open(ccl_log_t *log, const char *path) {
 		log->last_errno= 0;
 		return false;
 	}
-	
-	// recorded size must match actual file size
-	// recorded header_size must be at least as big as our struct
-	// block_size must be a power of 2, and size must be a multiple of block_size
-	if (!(
-		log->size == fileSize
-		&& coerce_block_size(log->block_size) == log->block_size
-		&& coerce_log_size(log->size, log->block_size) == log->size
-		&& log->header_size >= sizeof(header)
-	)) {
+
+	// recorded header_size must be at least as big as the minimum
+	if (log->header_size < CCL_MIN_HEADER_SIZE) {
 		log->last_err= CCL_ELOGINVAL;
 		log->last_errno= 0;
 		return false;
 	}
+	// read the rest of the header, up to the size of our header struct
+	if (log->header_size > CCL_MIN_HEADER_SIZE && sizeof(header) > CCL_MIN_HEADER_SIZE) {
+		extra= (log->header_size < sizeof(header)? log->header_size : sizeof(header)) - CCL_MIN_HEADER_SIZE;
+		if (!read_rec(log->fd, ((char*)header)+CCL_MIN_HEADER_SIZE, extra)) {
+			log->last_err= CCL_ELOGREAD;
+			log->lasat_errno= errno;
+			return false;
+		}
+		log->file_pos= sizeof(header);
+	}
+	
+	// Now it is safe to use the rest of the header fields we know about
 	
 	// Lock it for writing, if write-exclusive mode.
 	// In shared-write mode, we lock on each write operation.
@@ -286,6 +319,7 @@ bool ccl_open(ccl_log_t *log, const char *path) {
 	return true;
 }
 
+/*
 bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, bool force) {
 	ccl_log_t newLog;
 	ccl_log_header_t header;
@@ -407,6 +441,7 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, 
 	// All done!
 	return true;
 }
+*/
 
 int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value) {
 	switch (mode) {
@@ -445,15 +480,15 @@ inline int encode_size(uint64_t *encoded, uint64_t value) {
 	if (value >> 7) {
 		if (value >> 14) {
 			if (value >> 29) {
-				if (value > 60)
+				if (value >> 60)
 					return 0; // larger than 60 bit isn't supported (though could theoretically exist)
-				*encoded= (value << 4)+7;
+				*encoded= (value << 4)|7;
 				return 8;
 			}
-			*encoded= (value << 3)+3;
+			*encoded= (value << 3)|3;
 			return 4;
 		}
-		*encoded= (value << 2)+1;
+		*encoded= (value << 2)|1;
 		return 2;
 	}
 	*encoded= (value << 1);
@@ -568,6 +603,38 @@ bool buffered_write(ccl_log_t *log, char *data, int count, bool flush) {
 }
 
 bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
+	// determine sizeof_size
+	// determine total message space requirement
+	// compare with remaining space in data area (and whether fits in total message area)
+	// FOR each chunk
+	//   estimate that we'd rather use multiple syscalls than copy 1024 bytes
+	//   IF chunk.length < 1024
+	//     IF first, add size to buffer
+	//     add chunk to buffer
+	//     IF last, add suffix to buffer
+	//     write buffer
+	//   ELSE
+	//     IF first, write size
+	//     write chunk
+	//     if last, write suffix
+	//   END
+	// END
+	// If time to write next index marker, write new index marker
+	// if oldest index marker got overwritten, erase it
+	// if index changed, seek back to file position
+	return false;
+}
+
+bool ccl_read_message(ccl_log_t *log, ccl_message_info_t *msg_out) {
+	// read 3 x int64 before current file pos
+	// parse size, and verify checksum
+	// read the message into the log's buffer
+	// verify size is also at start of message
+	// present to user
+	return false;
+}
+
+/*
 	uint64_t encoded_size= 0;
 	int size_bytes, padding, count;
 	// leave room for padding(max=7), reverse_count(max=8), timestamp(8), checksum(8)
@@ -653,7 +720,7 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 	 * If we are continuing a message:
 	 *   - 0 < msg->data_ofs == log->msg_ofs < log->msg_len == msg->msg_len
 	 *   - log->file_pos is in a valid position (which we assume is the middle of the previous message's data)
-	 */
+	 *
 	
 	size_bytes= encode_size(&encoded_size, msg->msg_len);
 	
@@ -698,7 +765,7 @@ bool ccl_write_message(ccl_log_t *log, ccl_message_info_t *msg) {
 		log->msg_pos+= msg->data_len;
 	}
 	return true;
-}
+}*/
 
 ccl_message_info_t *ccl_read_message(ccl_log_t *log, int dataOfs, void *buf, int bufLen) {
 	return NULL;

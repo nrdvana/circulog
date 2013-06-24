@@ -40,10 +40,6 @@ echo "Makefile created at $buildroot";
 	echo "#endif"
 	echo "#include <endian.h>"
 	
-	# echo "include <sys/endian.h>"
-	
-	#echo "#include \"custom_endian.h\""
-	
 	echo "#include <errno.h>"
 	echo "#include <fcntl.h>"
 	echo "#include <time.h>"
