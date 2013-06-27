@@ -3,7 +3,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include "circulog.h"
 
 /** ccl_log_header_t : the actual header of a circulog log file
  *
@@ -13,8 +12,13 @@
  * The following must be true for the header to be valid:
  *  - magic == CCL_HEADER_MAGIC
  *  - version >= oldest_compat_version
- *  - size > header_size+index_size
  *  - header_size >= CCL_MIN_HEADER_SIZE
+ *  - index_start >= header_size
+ *  - index_size is a multiple of sizeof(ccl_log_index_entry_t)
+ *  - index_size / sizeof(ccl_log_index_entry_t) == ceil(spool_size / INDEX_GRANULARITY)
+ *  - spool_start >= index_start+index_size
+ *  - spool_size is a multiple of 8 bytes
+ *  - file size >= spool_start+spool_size
  *
  * The size field might not agree with the size of the log file.  In order to
  * mmap the file, its size might need to be rounded to the nearest multiple of
@@ -27,21 +31,28 @@ typedef struct ccl_log_header_s {
 		magic;
 	uint32_t
 		version,
-		oldest_compat_version;
-	uint64_t
-		size;
-	uint32_t
+		oldest_compat_version,
 		header_size,
-		index_size,
-		timestamp_precision,
-		reserved_0;
+		timestamp_precision;
 	int64_t
 		timestamp_epoch;
+	uint64_t
+		index_start,
+		index_size,
+		spool_start,
+		spool_size;
 } ccl_log_header_t;
 
+typedef struct ccl_log_header_s ccl_log_header_v0;
+
 #define CCL_HEADER_MAGIC 0x676f4c7563726943LL
-#define CCL_MIN_HEADER_SIZE 48
+#define CCL_MIN_HEADER_SIZE (sizeof(ccl_log_header_v0))
 #define CCL_CURRENT_VERSION 0x00000000
+#define CCL_DEFAULT_MAX_MESSAGE_SIZE 4096
+#define CCL_DEFAULT_SPOOL_SIZE (10*1024*1024)
+#define CCL_DEFAULT_TIMESTAMP_PRECISION 32
+#define CCL_INDEX_GRANULARITY_BITS 16
+#define CCL_INDEX_GRANULARITY (1<<CCL_INDEX_GRANULARITY_BITS)
 
 /** ccl_log_index_entry_t : format of each element in the index
  *
@@ -85,5 +96,41 @@ typedef struct ccl_log_index_entry_s {
 
 // sizeof_size * 2 + size + sizeof(timestamp) + sizeof(checksum) + padding of 1 to 8 bytes
 #define CCL_BYTES_NEEDED_FOR_MESSAGE(size, sizeof_size) ( ( ( (((sizeof_size)<<1)+(size)) >> 3) + 3) << 3)
+
+/** ccl_log_t: circulog object representing an open log.
+ *
+ * This struct is permitted to exist in varying states of validity.
+ * Always initialize with ccl_init, and call ccl_destroy when done, even if
+ * ccl_open failed ** unless ** you use ccl_new and ccl_delete, which call
+ * init and destroy for you.
+ */
+typedef struct ccl_log_s {
+	// Log-specific parameters
+	int header_size;
+	int version;
+	int timestamp_precision;
+	int64_t timestamp_epoch;
+	int max_message_size;
+	off_t index_start,
+		index_size,
+		spool_start,
+		spool_size;
+	//bool wrong_endian;
+	//bool dirty;
+	
+	int access; // CCL_READ, CCL_WRITE, CCL_SHARE
+	int fd;
+	void *memmap;
+	size_t memmap_size;
+	int iovec_size;
+	struct iov *iovec_buf;
+	int64_t spool_pos;
+	
+	// Storage for info about the last error
+	int last_err;
+	int last_errno;
+} ccl_log_t;
+
+#include "circulog.h"
 
 #endif

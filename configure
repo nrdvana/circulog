@@ -46,6 +46,7 @@ echo "Makefile created at $buildroot";
 	echo "#include <string.h>"
 	echo "#include <unistd.h>"
 	echo "#include <stdio.h>"
+	echo "#include <stdlib.h>"
 
 	echo "// For now, we require PCRE.  I'd like to make it optional in the future."
 	echo "#define CONFIG_PCRE"

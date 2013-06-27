@@ -1,6 +1,8 @@
 #ifndef CUSTOM_ENDIAN_H
 #define CUSTOM_ENDIAN_H
 
+#include <stdint.h>
+
 inline int16_t endian_swap_16(int16_t x) {
 	return (x << 8) | ((x >> 8) & 0xFF);
 }
@@ -16,11 +18,11 @@ inline int64_t endian_swap_64(int64_t x) {
 	return ((x & 0xFF00FF00FF00FFLL) << 8) | ((x >> 8) & 0xFF00FF00FF00FFLL);
 }
 
-#define LITTLE_ENDIAN 0x41424344UL 
-#define BIG_ENDIAN    0x44434241UL
-#define TARGET_ENDIAN ('ABCD')
+#define CUSTOM_ENDIAN_LITTLE_ENDIAN 0x41424344UL 
+#define CUSTOM_ENDIAN_BIG_ENDIAN    0x44434241UL
+#define CUSTOM_ENDIAN_TARGET_ENDIAN ('ABCD')
 
-#ifdef TARGET_ENDIAN == BIG_ENDIAN
+#ifdef CUSTOM_ENDIAN_TARGET_ENDIAN == CUSTOM_ENDIAN_BIG_ENDIAN
 #define htobe16(x) (x)
 #define htobe32(x) (x)
 #define htobe64(x) (x)
