@@ -43,6 +43,9 @@ install: $(targets)
 	$(INST) -m 555 -o root -g root -s circulog $(DESTDIR)/bin/circulog
 	$(INST) -m 555 -o root -g root -s cltail $(DESTDIR)/bin/cltail
 
+t: $(srcdir)/t
+	ln -sf $(srcdir)/t t
+
 clean:
 	rm *.o
 

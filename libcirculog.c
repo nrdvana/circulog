@@ -1,6 +1,5 @@
 #include "config.h"
 #include "circulog_internal.h"
-#include <sys/uio.h>
 
 ccl_log_t *ccl_new() {
 	ccl_log_t *log= (ccl_log_t*) malloc(sizeof(*log));
@@ -15,13 +14,16 @@ bool ccl_delete(ccl_log_t *log) {
 	return succ;
 }
 
-void ccl_init(ccl_log_t *log, int struct_size) {
+bool ccl_init(ccl_log_t *log, int struct_size) {
+	if (struct_size < sizeof(*log))
+		return false;
 	memset(log, 0, struct_size);
 	log->timestamp_precision= CCL_DEFAULT_TIMESTAMP_PRECISION;
 	log->max_message_size=    CCL_DEFAULT_MAX_MESSAGE_SIZE;
 	log->index_size=          1;
 	log->spool_size=          CCL_DEFAULT_SPOOL_SIZE;
 	log->fd= -1;
+	return true;
 }
 
 bool ccl_destroy(ccl_log_t *log) {
@@ -128,7 +130,7 @@ static bool lock_log(ccl_log_t *log) {
 	lock.l_start= 0;
 	lock.l_len= sizeof(ccl_log_header_t);
 	
-	if (log->access == CCL_SHARE) {
+	if (log->shared_write) {
 		// TODO: this is cheesy, but works for now.  Think up a better interface for write timeouts.
 		alarm(3);
 		ret= fcntl(log->fd, F_SETLKW, &lock);
@@ -227,18 +229,19 @@ int _create_logfile(ccl_log_t *log) {
 		)
 		return CCL_ELOGWRITE;
 	
-	// now initialize the 
-	
 	return 0;
 }
 
-int _load_logfile(ccl_log_t *log, const char *path, int access, bool create) {
+int _load_logfile(ccl_log_t *log, const char *path, int access) {
 	ccl_log_header_t header;
 	off_t file_size;
 	int extra;
+	bool create= (access & CCL_CREATE);
+	log->writeable= (access & (CCL_WRITE|CCL_SHARE));
+	log->shared_write= (access & CCL_SHARE) > CCL_WRITE;
 	
 	// open the file
-	log->fd= open(path, (create? O_CREAT:0) | (log->access > CCL_READ? O_RDWR : O_RDONLY), 0666);
+	log->fd= open(path, (create? O_CREAT:0) | (log->writeable? O_RDWR : O_RDONLY), 0666);
 	if (log->fd < 0)
 		return CCL_ELOGOPEN;
 	
@@ -267,8 +270,9 @@ int _load_logfile(ccl_log_t *log, const char *path, int access, bool create) {
 		return CCL_ELOGREAD;
 	
 	// check magic number, and determine endianness
-	if (header.magic != le64toh(CCL_HEADER_MAGIC))
+	if (le64toh(header.magic) != CCL_HEADER_MAGIC)
 		return CCL_ELOGINVAL;
+	
 		//if (header.magic == endian_swap_64(CCL_HEADER_MAGIC)) {
 		//log->wrong_endian= true;
 	
@@ -302,7 +306,7 @@ int _load_logfile(ccl_log_t *log, const char *path, int access, bool create) {
 	// Lock it for writing, if write-exclusive mode.
 	// In shared-write mode, we lock on each write operation.
 	// In read-only mode we make no locks at all.
-	if (log->access == CCL_WRITE) {
+	if (log->shared_write) {
 		if (!lock_log(log))
 			return log->last_err;
 		// check if the previous writer died unexpectedly
@@ -327,13 +331,13 @@ int _load_logfile(ccl_log_t *log, const char *path, int access, bool create) {
  * Returns true if successful, or false with a code in log->last_err on
  * failure.
  */
-bool ccl_open(ccl_log_t *log, const char *path, int access, bool create) {
+bool ccl_open(ccl_log_t *log, const char *path, int access) {
 	if (!log || log->fd >= 0) {
 		log->last_err= CCL_ELOGSTRUCT;
 		log->last_errno= 0;
 		return false;
 	}
-	log->last_err= _load_logfile(log, path, access, create);
+	log->last_err= _load_logfile(log, path, access);
 	if (log->last_err > 0) {
 		log->last_errno= errno;
 		if (log->fd >= 0) {

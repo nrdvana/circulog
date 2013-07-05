@@ -11,7 +11,7 @@ typedef struct ccl_log_s { int opaque[30]; } ccl_log_t;
 #endif
 
 extern ccl_log_t *ccl_new();
-extern void ccl_init(ccl_log_t *log, int struct_size);
+extern bool ccl_init(ccl_log_t *log, int struct_size);
 extern bool ccl_destroy(ccl_log_t *log);
 extern bool ccl_delete(ccl_log_t *log);
 
@@ -21,8 +21,9 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 #define CCL_READ 0
 #define CCL_WRITE 1
 #define CCL_SHARE 3
+#define CCL_CREATE 4
 
-extern bool ccl_open(ccl_log_t *log, const char *path, int access, bool create);
+extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
 #define CCL_SEEK_OLDEST    0
 #define CCL_SEEK_RELATIVE  1

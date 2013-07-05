@@ -118,7 +118,8 @@ typedef struct ccl_log_s {
 	//bool wrong_endian;
 	//bool dirty;
 	
-	int access; // CCL_READ, CCL_WRITE, CCL_SHARE
+	bool writeable: 1,
+		shared_write: 1;
 	int fd;
 	void *memmap;
 	size_t memmap_size;
