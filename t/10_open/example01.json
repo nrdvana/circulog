@@ -1,1 +1,1 @@
-{"version":0, "header_size": 64, "timestamp_precision": 32, "timestamp_epoch": 0, "max_message_size": 100, "index_start": 64, "index_size": 0, "spool_start": 4096, "spool_size": 4096 }
+{"version":0, "header_size": 72, "timestamp_precision": 32, "timestamp_epoch": 0, "max_message_size": 100, "index_start": 72, "index_size": 0, "spool_start": 4096, "spool_size": 4096 }

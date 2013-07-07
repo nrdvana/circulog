@@ -20,11 +20,10 @@
  *  - spool_size is a multiple of 8 bytes
  *  - file size >= spool_start+spool_size
  *
- * The size field might not agree with the size of the log file.  In order to
- * mmap the file, its size might need to be rounded to the nearest multiple of
- * the page size (such as 4KiB).  This physical resize of the file does not
- * affect the logical boundary which causes the log to wrap.  The size field
- * is the authority.
+ * The spool must start on a page boundary and be a multiple of the
+ * page size in order for the mmap optimizations to be used.
+ * However, files are not required to do this; they just become
+ * inelegible for the optimization.
  */
 typedef struct ccl_log_header_s {
 	uint64_t
@@ -41,6 +40,9 @@ typedef struct ccl_log_header_s {
 		index_size,
 		spool_start,
 		spool_size;
+	uint32_t
+		max_message_size,
+		reserved_01;
 } ccl_log_header_t;
 
 typedef struct ccl_log_header_s ccl_log_header_v0;

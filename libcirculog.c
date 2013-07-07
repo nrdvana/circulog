@@ -206,6 +206,7 @@ static bool log_create_file(ccl_log_t *log) {
 	header.index_size=            htole64(index_size);
 	header.spool_start=           htole64(spool_start);
 	header.spool_size=            htole64(spool_size);
+	header.max_message_size=      htole32(log->max_message_size);
 	
 	file_size= spool_start+spool_size;
 	
@@ -220,13 +221,13 @@ static bool log_create_file(ccl_log_t *log) {
 		)
 		return SET_ERR(log, CCL_EWRITE, "Failed to write new log: $syserr");
 	
-	return 0;
+	return true;
 }
 
 static bool log_load_file(ccl_log_t *log) {
 	ccl_log_header_t header;
 	off_t file_size;
-	int extra;
+	int extra, index_entries;
 	
 	file_size= lseek(log->fd, 0, SEEK_END);
 	if (file_size == (off_t)-1)
@@ -270,6 +271,7 @@ static bool log_load_file(ccl_log_t *log) {
 	log->index_size=          le64toh(header.index_size);
 	log->spool_start=         le64toh(header.spool_start);
 	log->spool_size=          le64toh(header.spool_size);
+	log->max_message_size=    le32toh(header.max_message_size);
 	
 	// Now it is safe to use the rest of the header fields we know about
 	
@@ -277,8 +279,17 @@ static bool log_load_file(ccl_log_t *log) {
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile is truncated (file size less than end of message spool)");
 	if (log->index_start < log->header_size)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile index overlaps with header");
+	if (log->index_size) {
+		index_entries= log->index_size / sizeof(ccl_log_index_entry_t);
+		if (index_entries * sizeof(ccl_log_index_entry_t) != log->index_size)
+			return SET_ERR(log, CCL_ELOGINVAL, "$logfile index size is not a multiple of log_index_entry_t");
+		if (index_entries != (log->spool_size + CCL_INDEX_GRANULARITY-1) >> CCL_INDEX_GRANULARITY_BITS)
+			return SET_ERR(log, CCL_ELOGINVAL, "$logfile index size does not match spool size");
+	}
 	if (log->spool_start < log->index_start + log->index_size)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool overlaps with index");
+	if (log->spool_size & 7)
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool size is not a multiple of 8");
 	if (log->timestamp_precision < 0 || log->timestamp_precision > 64)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile timestamp precision outside valid range");
 	
@@ -290,7 +301,7 @@ static bool log_load_file(ccl_log_t *log) {
 			return false;
 	}
 	
-	return 0;
+	return true;
 }
 
 /** ccl_open - open (and optionally create) a log

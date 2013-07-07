@@ -38,14 +38,16 @@ and do {
 		"CircuLog" # magic
 		.pack("V",0) # version
 		.pack("V",0) # oldest compat version
-		.pack("V",64) # header size
+		.pack("V",72) # header size
 		.pack("V",32) # timestamp precision
 		.pack("VV",0,0) # timestamp epoch
-		.pack("VV",64,0) # index start
+		.pack("VV",72,0) # index start
 		.pack("VV",0,0) # index size
 		.pack("VV",4096,0) # spool start
 		.pack("VV",4096,0) # spool size
-		.("\0" x (4096-64)) # alignment
+		.pack("V", 100) # max_message_size
+		.pack("V", 0) # reserved
+		.("\0" x (4096-72)) # alignment
 		.("\0" x 4096);     # spool data
 	length($expected) == $expected_size or die "Constant has wrong length";
 	local $/= undef;

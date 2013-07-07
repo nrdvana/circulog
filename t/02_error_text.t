@@ -33,14 +33,15 @@ my @tests= (
 	[ 'Testing', 'Testing' ],
 	[ 'Testing $logfile', 'Testing log file' ],
 	[ 'Testing $logfile: $syserr', 'Testing log file: Success' ],
+	[ 'x1234567890123456789012345678901234567890123456789012345678901234567689' => 'x12345678901234567890123456789012345678901234567890123456789012', 71 ],
 );
 
 for (@tests) {
-	my ($msg, $expected)= @$_;
+	my ($msg, $expected, $len)= @$_;
+	$len= length($expected) unless defined $len;
 	subtest $msg => sub {
 		my $escaped_msg= $msg;
 		$escaped_msg =~ s/\$/\\\$/g;
-		print $escaped_msg."\n";
 		my @result= `tmp/print_err "$escaped_msg"`;
 		if ($?) {
 			fail "print_err failed ".exitreason($?);
@@ -50,8 +51,8 @@ for (@tests) {
 			chomp(@result);
 			my ($text, $strlen, $bufferless_strlen)= @result;
 			is( $text, $expected, 'text' );
-			is( $strlen, length($expected), 'text len' );
-			is( $bufferless_strlen, length($expected), 'bufferless text len' );
+			is( $strlen, $len, 'text len' );
+			is( $bufferless_strlen, $len, 'bufferless text len' );
 		}
 		done_testing;
 	};
