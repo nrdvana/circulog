@@ -18,9 +18,9 @@ extern bool ccl_delete(ccl_log_t *log);
 extern bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits);
 extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_index, int max_message_size);
 
-#define CCL_READ 0
-#define CCL_WRITE 1
-#define CCL_SHARE 3
+#define CCL_READ   0
+#define CCL_WRITE  1
+#define CCL_SHARE  2
 #define CCL_CREATE 4
 
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
@@ -40,25 +40,29 @@ extern bool ccl_read_message(ccl_log_t *log, int dataOfs, void *buf, int bufLen)
 extern uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t);
 extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out);
 
-#define CCL_ESYSERR        0
-#define CCL_ELOGSTRUCT     1
-#define CCL_ELOGSTATE      2
-#define CCL_ELOGOPEN       3 
-#define CCL_ELOGVERSION    4 
-#define CCL_ELOGINVAL      5
-#define CCL_ELOGREAD       6
-#define CCL_ERDONLY        7
-#define CCL_ERESIZECREATE  8
-#define CCL_ERESIZENAME    9
-#define CCL_EGETLOCK      10
-#define CCL_EDROPLOCK     11
-#define CCL_ERESIZERENAME 12
-#define CCL_EPARAM        13
-#define CCL_ELOGWRITE     14
-#define CCL_EMSGSIZE      15
-#define CCL_ESIZELIMIT    16
+// Errors about misuse of API
+#define CCL_ELOGSTRUCT     0x10
+#define CCL_ELOGSTATE      0x11
+#define CCL_EREADONLY      0x12
+#define CCL_EMSGSIZE       0x13
+#define CCL_ESIZELIMIT     0x14
+#define CCL_EBADPARAM      0x15
+
+// Errors about file incompatibility or corruption
+#define CCL_ELOGVERSION    0x30
+#define CCL_ELOGINVAL      0x31
+#define CCL_EEOF           0x32
+
+// Errors about syscall failure
+#define CCL_ESYSERR        0x50
+#define CCL_EREAD          0x51
+#define CCL_EWRITE         0x52
+#define CCL_ESEEK          0x53
+#define CCL_ELOCK          0x54
+#define CCL_EOPEN          0x55
+#define CCL_ERENAME        0x56
 
 extern int ccl_err_code(ccl_log_t *log, int *syserr_out);
-extern const char* ccl_err_text(ccl_log_t *log, char* buf, int bufLen);
+extern int ccl_err_text(ccl_log_t *log, char* buf, int bufLen);
 
 #endif // CIRCULOG_H

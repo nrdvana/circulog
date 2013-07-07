@@ -130,6 +130,7 @@ typedef struct ccl_log_s {
 	// Storage for info about the last error
 	int last_err;
 	int last_errno;
+	const char* last_errmsg;
 } ccl_log_t;
 
 #include "circulog.h"

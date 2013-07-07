@@ -1,6 +1,13 @@
 #include "config.h"
 #include "circulog_internal.h"
 
+static inline bool SET_ERR(ccl_log_t *log, int code, const char* msg) {
+	log->last_err= code;
+	log->last_errno= errno;
+	log->last_errmsg= msg;
+	return false;
+}
+
 ccl_log_t *ccl_new() {
 	ccl_log_t *log= (ccl_log_t*) malloc(sizeof(*log));
 	if (!log) return NULL;
@@ -41,29 +48,25 @@ bool ccl_destroy(ccl_log_t *log) {
 }
 
 bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits) {
-	if (log->fd >= 0) {
-		log->last_err= CCL_ELOGSTATE;
-		log->last_errno= 0;
-		return false;
-	}
+	if (log->fd >= 0)
+		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
+	
 	log->timestamp_epoch= epoch;
 	log->timestamp_precision= precision_bits;
 	return true;
 }
 
 bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_index, int max_message_size) {
-	if (log->fd >= 0) {
-		log->last_err= CCL_ELOGSTATE;
-		log->last_errno= 0;
-		return false;
-	}
+	if (log->fd >= 0)
+		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
+	
 	log->spool_size= spool_size;
 	log->index_size= with_index? 1 : 0;
 	log->max_message_size= max_message_size;
 	return true;
 }
 
-uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t) {
+uint64_t ccl_timestamp_from_timespec(ccl_log_t *log, struct timespec *t) {
 	#ifdef _POSIX_TIMERS
 	struct timespec t2;
 	if (!t) {
@@ -77,7 +80,7 @@ uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t) {
 	return (((uint64_t) t->tv_sec - log->timestamp_epoch) << log->timestamp_precision) | (CCL_NSEC_TO_FRAC32(t->tv_nsec) >> (32-log->timestamp_precision));
 }
 
-void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out) {
+void ccl_timestamp_to_timespec(ccl_log_t *log, uint64_t ts, struct timespec *t_out) {
 	t_out->tv_sec=  (time_t) ((ts >> log->timestamp_precision) + log->timestamp_epoch);
 	t_out->tv_nsec= CCL_FRAC32_TO_NSEC((ts >> (log->timestamp_precision-32)) & 0xFFFFFFFFLL);
 	if (t_out->tv_nsec == 1000000000) {
@@ -86,41 +89,35 @@ void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out) {
 	}
 }
 
-static bool read_rec(int fd, void* record, int recordSize) {
+static bool log_read(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int got;
-	while (count < recordSize) {
-		got= read(fd, ((char*)record)+count, recordSize-count);
+	while (count < record_size) {
+		got= read(log->fd, ((char*)record)+count, record_size-count);
 		if (got > 0)
 			count+= got;
-		else if (got < 0 && errno != EINTR) {
-			return false;
-		} else {
-			errno= EPROTO;
-			return false;
-		}
+		else if (got < 0 && errno != EINTR)
+			return SET_ERR(log, CCL_EREAD, "read failed: $syserr");
+		else if (got == 0)
+			return SET_ERR(log, CCL_EEOF, "unexpected EOF");
 	}
 	return true;
 }
 
-static bool write_rec(int fd, const void *record, int32_t recordSize) {
+static bool log_write(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int wrote;
-	while (count < recordSize) {
-		wrote= write(fd, ((char*)record)+count, recordSize-count);
+	while (count < record_size) {
+		wrote= write(log->fd, ((char*)record)+count, record_size-count);
 		if (wrote > 0)
 			count+= wrote;
-		else if (wrote < 0 && errno != EINTR) {
-			return false;
-		} else {
-			errno= EPROTO; // not quite sensible, but this should never happen anyway
-			return false;
-		}
+		else if (wrote < 0 && errno != EINTR)
+			return SET_ERR(log, CCL_EWRITE, "write failed: $syserr");
 	}
 	return true;
 }
 
-static bool lock_log(ccl_log_t *log) {
+static bool log_lock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
 	
@@ -138,15 +135,12 @@ static bool lock_log(ccl_log_t *log) {
 	} else {
 		ret= fcntl(log->fd, F_SETLK, &lock);
 	}
-	if (ret < 0) {
-		log->last_err= CCL_EGETLOCK;
-		log->last_errno= errno;
-		return false;
-	}
+	if (ret < 0)
+		return SET_ERR(log, CCL_ELOCK, "Failed to lock logfile for writing: $syserr");
 	return true;
 }
 
-static bool unlock_log(ccl_log_t *log) {
+static bool log_unlock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
 	
@@ -157,15 +151,12 @@ static bool unlock_log(ccl_log_t *log) {
 	lock.l_len= sizeof(ccl_log_header_t);
 	
 	ret= fcntl(log->fd, F_SETLK, &lock);
-	if (ret < 0) {
-		log->last_err= CCL_EDROPLOCK;
-		log->last_errno= errno;
-		return false;
-	}
+	if (ret < 0)
+		return SET_ERR(log, CCL_ELOCK, "Failed to lock logfile for writing: $syserr");
 	return true;
 }
 
-int _create_logfile(ccl_log_t *log) {
+static bool log_create_file(ccl_log_t *log) {
 	ccl_log_header_t header;
 	long pagesize;
 	int64_t
@@ -220,77 +211,56 @@ int _create_logfile(ccl_log_t *log) {
 	
 	// overflow check
 	if (file_size < spool_start+spool_size)
-		return CCL_ESIZELIMIT;
+		return SET_ERR(log, CCL_ESIZELIMIT, "Spool size exceeds implementation limits");
 	
 	// now write the file
 	
 	if (ftruncate(log->fd, file_size) < 0
-		|| !write_rec(log->fd, &header, sizeof(header))
+		|| !log_write(log, &header, sizeof(header))
 		)
-		return CCL_ELOGWRITE;
+		return SET_ERR(log, CCL_EWRITE, "Failed to write new log: $syserr");
 	
 	return 0;
 }
 
-int _load_logfile(ccl_log_t *log, const char *path, int access) {
+static bool log_load_file(ccl_log_t *log) {
 	ccl_log_header_t header;
 	off_t file_size;
 	int extra;
-	bool create= (access & CCL_CREATE);
-	log->writeable= (access & (CCL_WRITE|CCL_SHARE));
-	log->shared_write= (access & CCL_SHARE) > CCL_WRITE;
 	
-	// open the file
-	log->fd= open(path, (create? O_CREAT:0) | (log->writeable? O_RDWR : O_RDONLY), 0666);
-	if (log->fd < 0)
-		return CCL_ELOGOPEN;
-	
-	// now find the length of the file
 	file_size= lseek(log->fd, 0, SEEK_END);
-	if (file_size == (off_t)-1 || lseek(log->fd, 0, SEEK_SET) == (off_t)-1 )
-		return CCL_ELOGOPEN;
+	if (file_size == (off_t)-1)
+		return SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
 	
-	// If file size is zero, and create was specified, initialize the log
-	if (file_size == 0 && create) {
-		log->last_err= _create_logfile(log);
-		if (log->last_err != 0)
-			return log->last_err;
-		
-		file_size= lseek(log->fd, 0, SEEK_END);
-		if (file_size == (off_t)-1 || lseek(log->fd, 0, SEEK_SET) == (off_t)-1 )
-			return CCL_ELOGOPEN;
-	}
-	
-	// we need at least sizeof(header)
-	if (file_size < CCL_MIN_HEADER_SIZE)
-		return CCL_ELOGINVAL;
+	if (lseek(log->fd, 0, SEEK_SET) == (off_t)-1)
+		return SET_ERR(log, CCL_ESEEK, "Can't seek to start of $logfile: $syserr");
 	
 	// read basic fields
-	if (!read_rec(log->fd, &header, CCL_MIN_HEADER_SIZE))
-		return CCL_ELOGREAD;
+	if (!log_read(log, &header, CCL_MIN_HEADER_SIZE))
+		return false;
 	
 	// check magic number, and determine endianness
 	if (le64toh(header.magic) != CCL_HEADER_MAGIC)
-		return CCL_ELOGINVAL;
+		return SET_ERR(log, CCL_ELOGINVAL, "Bad magic number in $logfile");
 	
-		//if (header.magic == endian_swap_64(CCL_HEADER_MAGIC)) {
-		//log->wrong_endian= true;
+	//if (be64toh(header.magic) == CCL_HEADER_MAGIC) {
+	//log->wrong_endian= true;
 	
 	// version check
 	if (le32toh(header.oldest_compat_version) > CCL_CURRENT_VERSION)
-		return CCL_ELOGVERSION;
+		return SET_ERR(log, CCL_ELOGVERSION, "$logfile version too new");
 	
-	log->header_size=         le32toh(header.header_size);
+	log->header_size= le32toh(header.header_size);
 	
 	// recorded header_size must be at least as big as the minimum
 	if (log->header_size < CCL_MIN_HEADER_SIZE)
-		return CCL_ELOGINVAL;
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile specifies an invalid header size");
 	
 	// read the rest of the header, up to the size of our header struct
 	if (log->header_size > CCL_MIN_HEADER_SIZE && sizeof(header) > CCL_MIN_HEADER_SIZE) {
 		extra= (log->header_size < sizeof(header)? log->header_size : sizeof(header)) - CCL_MIN_HEADER_SIZE;
-		if (!read_rec(log->fd, ((char*)&header)+CCL_MIN_HEADER_SIZE, extra))
-			return CCL_ELOGREAD;
+		if (!log_read(log, ((char*)&header)+CCL_MIN_HEADER_SIZE, extra))
+			return false;
 	}
 	
 	log->version=             le32toh(header.version);
@@ -303,14 +273,21 @@ int _load_logfile(ccl_log_t *log, const char *path, int access) {
 	
 	// Now it is safe to use the rest of the header fields we know about
 	
+	if ((uint64_t)file_size < log->spool_start + log->spool_size)
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile is truncated (file size less than end of message spool)");
+	if (log->index_start < log->header_size)
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile index overlaps with header");
+	if (log->spool_start < log->index_start + log->index_size)
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool overlaps with index");
+	if (log->timestamp_precision < 0 || log->timestamp_precision > 64)
+		return SET_ERR(log, CCL_ELOGINVAL, "$logfile timestamp precision outside valid range");
+	
 	// Lock it for writing, if write-exclusive mode.
 	// In shared-write mode, we lock on each write operation.
 	// In read-only mode we make no locks at all.
-	if (log->shared_write) {
-		if (!lock_log(log))
-			return log->last_err;
-		// check if the previous writer died unexpectedly
-		//log->dirty= header.writer_pid != 0;
+	if (log->writeable && !log->shared_write) {
+		if (!log_lock(log))
+			return false;
 	}
 	
 	return 0;
@@ -332,21 +309,37 @@ int _load_logfile(ccl_log_t *log, const char *path, int access) {
  * failure.
  */
 bool ccl_open(ccl_log_t *log, const char *path, int access) {
-	if (!log || log->fd >= 0) {
-		log->last_err= CCL_ELOGSTRUCT;
-		log->last_errno= 0;
-		return false;
+	bool create;
+	off_t file_size;
+	
+	if (!log) return false;
+	
+	if (log->fd >= 0)
+		return SET_ERR(log, CCL_ELOGSTATE, "Log object was already opened");
+	
+	create= (access & CCL_CREATE);
+	log->writeable= (access & CCL_WRITE);
+	log->shared_write= log->writeable && (access & CCL_SHARE);
+
+	// open the file
+	log->fd= open(path, (create? O_CREAT:0) | (log->writeable? O_RDWR : O_RDONLY), 0666);
+	if (log->fd < 0)
+		return SET_ERR(log, CCL_EOPEN, "Unable to open $logfile: $syserr");
+	
+	// now find the length of the file
+	file_size= lseek(log->fd, 0, SEEK_END);
+	if (file_size == (off_t)-1)
+		SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
+	// If file size is zero, and create was specified, initialize the log
+	// or, if file size > 0, just try loading it.
+	else if (file_size > 0 || (create && log_create_file(log))) {
+		if (log_load_file(log))
+			return true;
 	}
-	log->last_err= _load_logfile(log, path, access);
-	if (log->last_err > 0) {
-		log->last_errno= errno;
-		if (log->fd >= 0) {
-			close(log->fd);
-			log->fd= -1;
-		}
-		return false;
-	}
-	return true;
+	// if we failed, put the log object back in a closed state
+	close(log->fd);
+	log->fd= -1;
+	return false;
 }
 
 /*
@@ -490,7 +483,7 @@ int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value) {
 		return 0;
 	}
 }
-/*
+
 inline int64_t nextBlock(ccl_log_t *log, int64_t addr) {
 	int64_t mask= log->block_size-1;
 	addr= ((addr+mask) & ~mask);
@@ -709,7 +702,7 @@ bool ccl_read_message(ccl_log_t *log, ccl_message_info_t *msg_out) {
 	return false;
 }
 
-/*
+
 	uint64_t encoded_size= 0;
 	int size_bytes, padding, count;
 	// leave room for padding(max=7), reverse_count(max=8), timestamp(8), checksum(8)
@@ -786,7 +779,7 @@ bool ccl_read_message(ccl_log_t *log, ccl_message_info_t *msg_out) {
 		}
 	}
 	
-	/*
+	*
 	 * We now have asserted the following conditions:
 	 * If we are writing a new message:
 	 *   - 0 == msg->data_ofs == log->msg_ofs == log->msg_len < msg->msg_len
@@ -846,58 +839,63 @@ ccl_message_info_t *ccl_read_message(ccl_log_t *log, int dataOfs, void *buf, int
 	return NULL;
 }
 */
-static const char* errorTable[]= {
-	/* CCL_ESYSERR       */ "%m",
-	/* CCL_ELOGSTRUCT    */ "Log object is invalid",
-	/* CCL_ELOGSTATE     */ "Cannot perform action on log in current state",
-	/* CCL_ELOGOPEN      */ "Failed to open log file: %m",
-	/* CCL_ELOGVERSION   */ "Unsupported log file version",
-	/* CCL_ELOGINVAL     */ "Invalid log format",
-	/* CCL_ELOGREAD      */ "Failed to read log: %m",
-	/* CCL_ERDONLY       */ "Log was opened read-only",
-	/* CCL_ERESIZECREATE */ "Log resize failed: Unable to create temp log file: %m",
-	/* CCL_ERESIZENAME   */ "Log resize failed: Temp log file name too long",
-	/* CCL_EGETLOCK      */ "Failed to lock log file.  fcntl: %m",
-	/* CCL_EDROPLOCK     */ "Failed to unlock log file. fcntl: %m",
-	/* CCL_ERESIZERENAME */ "Failed to rename resized file to log file: %m",
-	/* CCL_EMSGPARAM     */ "Invalid message_info parameters",
-	/* CCL_ELOGWRITE     */ "Failed to write log: %m",
-	/* CCL_EMSGSIZE      */ "Message size too large",
-	/* CCL_ESIZELIMIT    */ "Log size exceeds implementation constraints"
-};
 
-const char* ccl_err_text(ccl_log_t *log, char* buf, int bufLen) {
-	const char* errFmt, *pct_m;
-	int cnt;
+int ccl_err_code(ccl_log_t *log, int *syserr_out) {
+	if (syserr_out)
+		*syserr_out= log->last_errno;
+	return log->last_err;
+}
+
+int ccl_err_text(ccl_log_t *log, char* buf, int buflen) {
+	const char *msg, *next_var, *err_str;
+	char *pos;
+	int count, bufpos, n;
 	
-	if (bufLen < 2) return "";
-	if (log->last_err < 0 || log->last_err >= sizeof(errorTable)/sizeof(*errorTable))
-		return "[invalid error number]";
-	errFmt= errorTable[log->last_err];
+	if (!(msg= log->last_errmsg))
+		msg= "no error";
 	
-	// Here, we manually perform one substitution of "%m", and deal with all the
-	//   shitty APIs of strerror, strerror_r, and glibc strerror_r.
-	if ((pct_m= strstr(errFmt, "%m"))) {
-		cnt= snprintf(buf, bufLen, "%.*s", pct_m - errFmt, errFmt);
-		if (cnt < bufLen-1) {
-			// append the system error string
-			#ifdef POSIX_STRERROR
-			strerror_r(log->last_errno, buf, bufLen-cnt);
-			if (buf[cnt] == '\0')
-				cnt+= snprintf(buf+cnt, bufLen-cnt, "[strerror failed]");
-			#else
-			const char *sysErrMsg= strerror_r(log->last_errno, buf+cnt, bufLen-cnt);
-			if (buf[cnt] == '\0')
-				cnt+= snprintf(buf+cnt, bufLen-cnt, "%s", sysErrMsg);
-			#endif
-			
-			// then append the rest of the format-string
-			if (cnt < bufLen-1)
-				snprintf(buf+cnt, bufLen-cnt, "%s", pct_m+2);
+	// perform substitutions on "$var"
+	bufpos= 0;
+	while (*msg) {
+		next_var= strchr(msg, '$');
+		// copy literal portion of message
+		count= next_var? next_var-msg : strlen(msg);
+		if (bufpos < buflen)
+			memcpy(buf+bufpos, msg, count < (buflen-bufpos)? count : (buflen-bufpos));
+		msg+= count;
+		bufpos+= count;
+		// If ended on a variable,
+		if (next_var) {
+			next_var++; // skip '$' to reach start of the name
+			msg= next_var;
+			// iterate to end of the name
+			while (*msg >= 'a' && *msg <= 'z') msg++;
+			// identify it
+			count= msg - next_var; // length of name
+			n= buflen > bufpos? buflen-bufpos : 0; 
+			pos= buflen > bufpos? buf+bufpos : NULL; // place in buffer to write (or null, to only calc length)
+			if (strncmp(next_var, "syserr", count) == 0) {
+				char errbuf[128];
+				// Here, we deal with stupidity regarding strerror.
+				// If only sprintf(%m) were portable...
+				#if (_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && ! _GNU_SOURCE
+				err_str= errbuf;
+				if (strerror_r(log->last_errno, errbuf, sizeof(errbuf)) < 0)
+					snprintf(errbuf, sizeof(errbuf), "errno %d", (int) log->last_errno);
+				#else
+				err_str= strerror_r(log->last_errno, errbuf, sizeof(errbuf));
+				#endif
+				bufpos+= snprintf(pos, n, "%s", err_str);
+			}
+			else if (strncmp(next_var, "logfile", count) == 0) {
+				bufpos+= snprintf(pos, n, "%s", "log file"); // TODO: sub file name, if known
+			}
+			else {
+				bufpos+= snprintf(pos, n, "$%.*s", count, next_var);
+			}
 		}
 	}
-	else {
-		snprintf(buf, bufLen, "%s", errFmt);
-	}
-	return buf;
+	if (buflen)
+		buf[bufpos < buflen? bufpos : buflen-1]= '\0';
+	return bufpos;
 }

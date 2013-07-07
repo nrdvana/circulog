@@ -63,8 +63,11 @@ sub ok_c_prog {
 	if ($err) {
 		chomp($err);
 		fail defined $comment? "$err: $comment" : $err;
+		return '';
+	} else {
+		defined $comment? pass $comment : pass;
+		return 1;
 	}
-	defined $comment? pass $comment : pass;
 }
 
 sub hexdump {

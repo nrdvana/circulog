@@ -11,34 +11,7 @@ BEGIN {
 use lib "t/lib";
 use Test::C_Prog;
 
-ok_c_prog( <<END , 'new' );
-#include <circulog.h>
-int main() {
-	ccl_log_t *log= ccl_new();
-	if (!log) return 2;
-	return 0;
-}
-END
-
-ok_c_prog( <<END , 'new + delete' );
-#include <circulog.h>
-int main() {
-	ccl_log_t *log= ccl_new();
-	if (!log) return 2;
-	if (!ccl_delete(log)) return 3;
-	return 0;
-}
-END
-
-ok_c_prog( <<END , 'init on buffer' );
-#include <circulog.h>
-int main() {
-	ccl_log_t log;
-	if (!ccl_init(&log, sizeof(log))) return 2;
-	return 0;
-}
-END
-
+unlink("tmp/testlog.ccl");
 ok_c_prog( <<END , 'create from scratch' )
 #include <circulog.h>
 #include <stdio.h>

@@ -47,9 +47,9 @@ END
 my $jsoncoder= JSON::PP->new->relaxed->allow_singlequote;
 for (qw: example01 :) {
 	subtest $_ => sub {
-		-e "t/02_open/$_.json" or die "No such example log specs: $_";
-		-f "t/02_open/$_.log" or die "No such example log: $_";
-		my $specs= $jsoncoder->decode(slurp("t/02_open/$_.json"));
+		-e "t/10_open/$_.json" or die "No such example log specs: $_";
+		-f "t/10_open/$_.log" or die "No such example log: $_";
+		my $specs= $jsoncoder->decode(slurp("t/10_open/$_.json"));
 		my $actual_json= `tmp/read_specs "t/02_open/$_.log"`;
 		if ($?) {
 			fail "read_specs failed ".exitreason($?);
