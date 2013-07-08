@@ -55,6 +55,7 @@ typedef struct ccl_log_header_s ccl_log_header_v0;
 #define CCL_DEFAULT_TIMESTAMP_PRECISION 32
 #define CCL_INDEX_GRANULARITY_BITS 16
 #define CCL_INDEX_GRANULARITY (1<<CCL_INDEX_GRANULARITY_BITS)
+#define CCL_INDEX_ENTRY_SIZE (sizeof(ccl_log_index_entry_t))
 
 /** ccl_log_index_entry_t : format of each element in the index
  *
@@ -125,8 +126,8 @@ typedef struct ccl_log_s {
 	int fd;
 	void *memmap;
 	size_t memmap_size;
-	int iovec_size;
-	struct iov *iovec_buf;
+	int iovec_count;
+	struct iovec *iovec_buf;
 	int64_t spool_pos;
 	
 	// Storage for info about the last error

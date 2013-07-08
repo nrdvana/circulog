@@ -47,6 +47,45 @@ bool ccl_destroy(ccl_log_t *log) {
 	return !err;
 }
 
+bool log_resize_iovec(ccl_log_t *log, int new_count) {
+	void *newbuf;
+	newbuf= realloc(log->iovec_buf, sizeof(struct iovec) * new_count);
+	if (!newbuf)
+		return SET_ERR(log, CCL_ESYSERR, "malloc: $syserr");
+	log->iovec_buf= newbuf;
+	log->iovec_count= new_count;
+	return true;
+}
+
+bool ccl_msg_init(ccl_msg_t *msg) {
+	memset(msg, 0, sizeof(*msg));
+	return true;
+}
+
+bool ccl_msg_destroy(ccl_msg_t *msg) {
+	if (!msg->user_buffer && !msg->hot_buffer) {
+		free(msg->data);
+		msg->data= NULL;
+		msg->data_len= 0;
+		msg->buffer_len= 0;
+	}
+	return true;
+}
+
+// Resize the buffer of a message object.
+// Only allowed if the buffer is dynamic (not a view of mmapped data, and not user-allocated)
+bool msg_resize(ccl_msg_t *msg, int newsize) {
+	void* newbuf;
+	if (msg->user_buffer || msg->hot_buffer)
+		return false;
+	newbuf= realloc(msg->data, newsize);
+	if (!newbuf)
+		return false;
+	msg->data= (char*) newbuf;
+	msg->buffer_len= newsize;
+	return true;
+}
+
 bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits) {
 	if (log->fd >= 0)
 		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
@@ -89,6 +128,12 @@ void ccl_timestamp_to_timespec(ccl_log_t *log, uint64_t ts, struct timespec *t_o
 	}
 }
 
+static inline bool log_seek(ccl_log_t *log, off_t offset) {
+	if (lseek(log->fd, offset, SEEK_SET) == (off_t)-1)
+		return SET_ERR(log, CCL_ESEEK, "seek failed: $syserr");
+	return true;
+}
+
 static bool log_read(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int got;
@@ -113,6 +158,29 @@ static bool log_write(ccl_log_t *log, void* record, int record_size) {
 			count+= wrote;
 		else if (wrote < 0 && errno != EINTR)
 			return SET_ERR(log, CCL_EWRITE, "write failed: $syserr");
+	}
+	return true;
+}
+
+static bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
+	int wrote;
+	while (iov_count) {
+		wrote= writev(log->fd, iov, iov_count);
+		if (wrote < 0) {
+			if (errno == EINTR) continue;
+			return SET_ERR(log, CCL_EWRITE, "write failed: $syserr");
+		}
+		while (wrote && iov_count) {
+			if (wrote >= iov[0].iov_len) {
+				wrote -= iov[0].iov_len;
+				iov++;
+				iov_count--;
+			} else {
+				iov[0].iov_len-= wrote;
+				iov[0].iov_base= ((char*)iov[0].iov_base) + wrote;
+				wrote= 0;
+			}
+		}
 	}
 	return true;
 }
@@ -233,7 +301,7 @@ static bool log_load_file(ccl_log_t *log) {
 	if (file_size == (off_t)-1)
 		return SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
 	
-	if (lseek(log->fd, 0, SEEK_SET) == (off_t)-1)
+	if (!log_seek(log, 0))
 		return SET_ERR(log, CCL_ESEEK, "Can't seek to start of $logfile: $syserr");
 	
 	// read basic fields
@@ -475,10 +543,25 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, 
 	// All done!
 	return true;
 }
-*
+*/
 
-int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value) {
-	switch (mode) {
+/** ccl_seek - find the nearest message for some criteria
+ *
+ * Reading a CircuLog is a best-effort sort of algorithm, which runs
+ * unsynchronized with the writing process, and may or may not succeed.
+ * This function attempts to find the log message you were interested in,
+ * though no guarantees are made as to whether the located message will
+ * still exist by the time you try to read it.
+ *
+ * This function basically just seeks to a position, and then searches
+ * through the spool looking for something which is a valid message.
+ *
+ * Creating a log file with the "index" feature will speed this up.
+ * (not yet implemented)
+ */
+bool ccl_seek(ccl_log_t *log, int mode, int64_t value) {
+	return false;
+/*	switch (mode) {
 	case CCL_SEEK_OLDEST:
 	case CCL_SEEK_RELATIVE:
 	case CCL_SEEK_NEWEST:
@@ -492,24 +575,9 @@ int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value) {
 		log->last_err= CCL_EPARAM;
 		log->last_errno= 0;
 		return 0;
-	}
+	}*/
 }
 
-inline int64_t nextBlock(ccl_log_t *log, int64_t addr) {
-	int64_t mask= log->block_size-1;
-	addr= ((addr+mask) & ~mask);
-	return addr > log->size? log->header_size : addr;
-}
-inline int64_t firstMsgInBlock(int64_t blockAddr) {
-	return addr+log->block_size-8
-}
-
-typedef int bsearch_callback_t(int64_t timestamp);
-bool block_search(ccl_log_t *log, bsearch_callback_t *test) {
-	int64_t addr= log->header_size;
-	
-}
-*
 inline int encode_size(uint64_t value, uint64_t *encoded_out) {
 	if (value >> 14) {
 		if (value >> 29) {
@@ -553,157 +621,147 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
 	}
 }
 
-bool ccl_write_message(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp) {
-	uint64_t i64_buf[4];
-	int i, iov_count_tmp;
-	struct iovec iov_tmp, *iov;
-	int64_t freespace, msglen, msglen2, msg_filepos, bytes_needed;
+bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp) {
+	uint64_t prefix[1], suffix[3];
+	int i, prefix_size, suffix_size, first_part, ofs;
+	struct iovec *iov;
+	ccl_log_index_entry_t index_entry;
+	int64_t msglen, msglen2, record_len, spool_pos, prev_index_entry, last_index_entry;
 	
 	// access-mode check
-	if (log->access == CCL_READ) {
-		log->last_err= CCL_ERDONLY;
-		log->last_errno= 0;
-		return false;
-	}
+	if (!log->writeable)
+		return SET_ERR(log, CCL_EREADONLY, "Can't write to read-only log");
+	
 	// TODO: add support for shared write-access
-	if (log->access == CCL_SHARE) {
-		log->last_err= CCL_ESYSERR;
-		log->last_errno= 0;
-		return false;
-	}
+	if (log->shared_write)
+		if (!log_lock(log))
+			return false;
 	
 	// Fill in the timestamp with "now()" if not specified by the user
 	if (timestamp == 0) {
-		timestamp= ccl_encode_timestamp(log, NULL);
-		if (timestamp == 0) {
-			log->last_err= CCL_ESYSERR;
-			log->last_errno= errno;
-			return false;
-		}
+		timestamp= ccl_timestamp_from_timespec(log, NULL);
+		if (timestamp == 0)
+			return SET_ERR(log, CCL_ESYSERR, "Can't generate timestamp: $syserr");
 	}
 	
 	// sum up the message size
-	// start at 64 so we can check the whole record size for overflow
+	// start at 64 so we can check the whole record size for int overflow
+	//  on 32-bit (or less likely, overflow on 64-bit)
 	msglen= 64;
 	for (i= 0; i < iov_count; i++) {
-		msglen2= msglen + iov[i].iov_len;
-		if (msglen2 < msglen) {
-			log->last_err= CCL_EMSGSIZE;
-			log->last_errno= 0;
-			return false;
-		}
+		msglen2= msglen + caller_iov[i].iov_len;
+		if (msglen2 < msglen)
+			return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds implementation limits");
 		msglen= msglen2;
 	}
 	msglen -= 64; // subtract it back off
 	// check vs. max message size
-	if (msglen > log->max_message_size) {
-		log->last_err= CCL_EMSGSIZE;
-		log->last_errno= 0;
-		return false;
-	}
+	if (msglen > log->max_message_size)
+		return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds max_message_size of log");
 	
 	// encode the variable-length size, and determine its size
-	sizeof_size= encode_size(msglen, &i64_buf[0]);
-	if (!sizeof_size) {
-		log->last_err= CCL_EMSGSIZE;
-		log->last_errno= 0;
-		return false;
-	}
+	prefix_size= encode_size(msglen, prefix);
+	if (!prefix_size)
+		return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds implementation limits");
+	suffix_size= 8 + 8 + 8 - ((prefix_size + msglen) & 0x7);
 	
-	msg_filepos= log->next_message_filepos;
-	
-	// first size gets encoded little-endian, and second size gets encoded big-endian
-	i64_buf[1]= i64_buf[0];
-	i64_buf[0]= htole64(i64_buf[0]);
-	i64_buf[1]= htobe64(i64_buf[1]);
+	// prefix size gets encoded little-endian, and suffix size gets encoded big-endian
+	suffix[0]= htobe64(prefix[0]);
+	prefix[0]= htole64(prefix[0]);
 	// after reverse size is timestamp, and checksum, encoded as little-endian
-	i64_buf[2]= htole64(timestamp);
-	i64_buf[3]= CCL_MESSAGE_CHECKSUM(msglen, timestamp, msg_filepos);
+	suffix[1]= htole64(timestamp);
+	suffix[2]= htole64(CCL_MESSAGE_CHECKSUM(msglen, timestamp, log->spool_start+log->spool_pos));
 	
-	// ensure we have enough iov slots for this message
-	// (we re-use an iovec which we keep in log->iovec_buf)
-	if (log->iovec_count < iov_count+2) {
-		newbuf= realloc(log->iovec_buf, sizeof(*iov) * (iov_count+2));
-		if (!newbuf) {
-			log->last_err= CCL_ESYSERR;
-			log->last_errno= errno;
-			return false;
-		}
-		log->iovec_buf= newbuf;
-		log->iovec_count= iov_count+2;
+	// Also calculate which index entries are affected
+	// An index entry is updated if this is the first message to be written into it.
+	record_len= prefix_size + msglen + suffix_size;
+	prev_index_entry= (log->spool_pos-1) >> CCL_INDEX_GRANULARITY_BITS;
+	// (We handle wrap-around later)
+	last_index_entry= (log->spool_pos+record_len) >> CCL_INDEX_GRANULARITY_BITS;
+	
+	// If we're in mmap mode, do things the easy way
+	if (log->memmap) {
+		abort(); // TODO: implement
 	}
-	iov= (struct iovec *) log->iovec_buf;
-	
-	// now build the new iov
-	iov[0].iov_base= (void*) i64_buf;
-	iov[0].iov_len=  (size_t) sizeof_size;
-	memcpy(iov+1, caller_iov, sizeof(*iov) * iov_count);
-	iov_count++;
-	iov[iov_count].iov_base= (void*)(((char*)(i64_buf+2)) - sizeof_size);
-	iov[iov_count].iov_len=  8 + 8 + 8 - ((sizeof_size + msglen) & 0x7)
-	iov_count++;
-	
-	// determine total message record size
-	bytes_needed= msglen + iov[0].iov_len + iov[iov_count].iov_len;
-	log->bytes_til_next_index-= bytes_needed;
-	
-	// compare with remaining space in data area
-	// when we reach the end of the file, we have to split the message in 2 pieces.
-	freespace= log->size - log->next_message_filepos;
-	if (bytes_needed > freespace && freespace > 0) {
-		bytes_needed -= freespace;
-		iov_count_tmp= 0;
-		while (freespace) {
-			if (freespace >= iov[iov_count_tmp].iov_len) {
-				iov_count_tmp++
-				freespace -= iov[iov_count_tmp].iov_len;
-			}
-			else {
-				iov_tmp= iov[iov_count_tmp];
-				iov[iov_count_tmp].iov_len= (size_t) freespace;
-				iov_count_tmp++;
-				freespace= 0;
-			}
-		}
+	// else call seek and writev
+	else {
+		// we build a new io vector containing the prefix, user's vectors, and suffix.
+		// (we re-use an iovec which we keep in log->iovec_buf)
+		if (log->iovec_count < iov_count+2)
+			if (!log_resize_iovec(log, iov_count+2))
+				return false;
+		iov= log->iovec_buf;
 		
-		writeev_all(log, iov, iov_count_tmp)
-			or return false;
-		// then seek to start of message area
-		if (lseek(log->fd, (size_t) log->header_size + log->index_size, SEEK_SET) < 0) {
-			log->last_err= CCL_ELOGWRITE;
-			log->last_errno= errno;
+		// now build the new iov
+		iov[0].iov_base= (void*)  prefix;
+		iov[0].iov_len=  (size_t) prefix_size;
+		memcpy(iov+1, caller_iov, sizeof(*iov) * iov_count);
+		iov_count++;
+		iov[iov_count].iov_base= (void*)( ((char*)suffix) + sizeof(suffix) - suffix_size);
+		iov[iov_count].iov_len=  suffix_size;
+		iov_count++;
+			
+		// now write it
+		spool_pos= log->spool_pos;
+		// TODO: find way to prevent this call by knowing if we're at spool_pos already
+		if (!log_seek(log, log->spool_start + spool_pos))
 			return false;
-		}
-		log->next_message_filepos= log->header_size + log->index_size;
-		log->bytes_til_next
 		
-		// If the final iov was clipped,
-		if (iov[iov_count_tmp-1].iov_len < iov_tmp.iov_len) {
-			// shift the final iov to point to its other half
-			iov+= iov_count_tmp - 1;
-			iov_count -=  iov_count_tmp - 1;
-			iov[0].iov_base= ((char*)(iov[0].iov_base)) + iov[0].iov_len;
-			iov[0].iov_len = iov_tmp.iov_len - iov[0].iov_len;
+		// Will this message wrap?  if not, just call writev.  If it will,
+		// just write the individual buffers one at a time and split the one
+		// that crosses the boundary.
+		if (spool_pos + record_len <= log->spool_size) {
+			if (!log_writev(log, iov, iov_count))
+				return false;
 		}
 		else {
-			iov += iov_count_tmp;
-			iov_count -= iov_count_tmp;
+			for (i= 0; i < iov_count; i++) {
+				if (spool_pos + iov[i].iov_len <= log->spool_size) {
+					if (!log_write(log, iov[i].iov_base, iov[i].iov_len))
+						return false;
+					spool_pos+= iov[i].iov_len;
+				}
+				else {
+					first_part= log->spool_size - spool_pos;
+					if (!log_write(log, iov[i].iov_base, first_part))
+						return false;
+					if (!log_seek(log, log->spool_start))
+						return false;
+					if (!log_write(log, ((char*)iov[i].iov_base)+first_part, iov[i].iov_len-first_part))
+						return false;
+					spool_pos= iov[i].iov_len-first_part;
+				}
+			}
+		}
+		// write index entries if necessary
+		if (log->index_size && prev_index_entry < last_index_entry) {
+			index_entry.timestamp=  htole64(timestamp);
+			index_entry.msg_offset= htole64(log->spool_pos);
+			ofs= (prev_index_entry+1) * CCL_INDEX_ENTRY_SIZE;
+			// trick to re-use code below
+			if (ofs < log->index_size)
+				ofs+= log->index_size;
+			// write each entry
+			for (i= last_index_entry-prev_index_entry; i < 0; i--) {
+				if (ofs >= log->index_size) {
+					ofs-= log->index_size;
+					if (!log_seek(log, log->index_start + ofs))
+						return false;
+				}
+				if (!log_write(log, &index_entry, sizeof(index_entry)))
+					return false;
+			}
 		}
 	}
 	
-	writeev_all(log, iov, iov_count)
-		or return false;
-	log->next_message_filepos+= bytes_needed;
-	
-	// update any index boundaries we've crossed
-		printf("stub: update index\n");
-		// FOR each ?KB boundary our message overlaps,
-		//   update that index entry
-		// if index changed, seek back to file position
-	
-	return false;
+	// Finally, update spool_pos
+	log->spool_pos+= record_len;
+	if (log->spool_pos - log->spool_size > 0)
+		log->spool_pos-= log->spool_size;
+	return true;
 }
 
+/*
 bool ccl_read_message(ccl_log_t *log, ccl_message_info_t *msg_out) {
 	// read 3 x int64 before current file pos
 	// parse size, and verify checksum

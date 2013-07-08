@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include <string.h>
 #include <sys/uio.h>
 
 #ifndef CIRCULOG_INTERNAL_H
@@ -25,17 +26,44 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
+//extern bool ccl_write_str(ccl_log_t *log, const char *data, int64_t timestamp= 0);
+//extern bool ccl_write_data(ccl_log_t *log, const char *data, int length, int64_t timestamp= 0);
+extern bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp);
+
+inline bool ccl_write_str(ccl_log_t *log, const char *str, int64_t timestamp) {
+	struct iovec tmp;
+	tmp.iov_base= (void*) str;
+	tmp.iov_len= strlen(str);
+	return ccl_write_vec(log, &tmp, 1, timestamp);
+}
+
+inline bool ccl_write_data(ccl_log_t *log, const void *data, int length, int64_t timestamp) {
+	struct iovec tmp;
+	tmp.iov_base= (void*) data;
+	tmp.iov_len= length;
+	return ccl_write_vec(log, &tmp, 1, timestamp);
+}
+
+typedef struct ccl_msg_s {
+	bool
+		user_buffer:1,
+		hot_buffer:1;
+	int64_t address;
+	int64_t timestamp;
+	char *data;
+	int data_len;
+	int buffer_len;
+} ccl_msg_t;
+
+extern bool ccl_msg_init(ccl_msg_t *msg);
+extern bool ccl_msg_destroy(ccl_msg_t *msg);
+
 #define CCL_SEEK_OLDEST    0
 #define CCL_SEEK_RELATIVE  1
 #define CCL_SEEK_NEWEST    2
 #define CCL_SEEK_ADDR      3
-#define CCL_SEEK_LIMIT     4
-#define CCL_SEEK_TIME      5
-
-extern int64_t ccl_seek(ccl_log_t *log, int mode, int64_t value);
-
-extern bool ccl_write_message(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp);
-extern bool ccl_read_message(ccl_log_t *log, int dataOfs, void *buf, int bufLen);
+#define CCL_SEEK_TIME      4
+extern bool ccl_read_message(ccl_log_t *log, int seek_mode, int64_t value, ccl_msg_t *msg);
 
 extern uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t);
 extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out);

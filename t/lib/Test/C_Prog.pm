@@ -85,7 +85,7 @@ sub blob_diff {
 		$expected_ctx= hexdump($expected_ctx);
 		$actual_ctx= hexdump($actual_ctx);
 	}
-	return "Difference at offset $i: \"$expected_ctx\" != \"$actual_ctx\"";
+	return "Difference at offset $i: \"$actual_ctx\" != \"$expected_ctx\"";
 }
 
 1;
