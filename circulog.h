@@ -26,8 +26,6 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
-//extern bool ccl_write_str(ccl_log_t *log, const char *data, int64_t timestamp= 0);
-//extern bool ccl_write_data(ccl_log_t *log, const char *data, int length, int64_t timestamp= 0);
 extern bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp);
 
 inline bool ccl_write_str(ccl_log_t *log, const char *str, int64_t timestamp) {
@@ -45,36 +43,42 @@ inline bool ccl_write_data(ccl_log_t *log, const void *data, int length, int64_t
 }
 
 typedef struct ccl_msg_s {
-	bool
-		user_buffer:1,
-		hot_buffer:1;
 	int64_t address;
 	int64_t timestamp;
-	char *data;
+	int64_t msg_len;
+	const char *data;
 	int data_len;
+	char *buffer;
 	int buffer_len;
+	int offset;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);
 extern bool ccl_msg_destroy(ccl_msg_t *msg);
 
-#define CCL_SEEK_OLDEST    0
-#define CCL_SEEK_RELATIVE  1
-#define CCL_SEEK_NEWEST    2
-#define CCL_SEEK_ADDR      3
-#define CCL_SEEK_TIME      4
-extern bool ccl_read_message(ccl_log_t *log, int seek_mode, int64_t value, ccl_msg_t *msg);
+#define CCL_SEEK_ADDR     0x0000
+#define CCL_SEEK_TIME     0x0001
+#define CCL_SEEK_OLDEST   0x0002
+#define CCL_SEEK_NEWEST   0x0003
+#define CCL_SEEK_PREV     0x0004
+#define CCL_SEEK_NEXT     0x0005
+#define CCL_SEEK_RELATIVE 0x0006
+#define CCL_SEEK_MASK     0x000F
+#define CCL_BUFFER_AUTO   0x0100
+#define CCL_NODATA        0x0200
+extern bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags);
 
 extern uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t);
 extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out);
 
-// Errors about misuse of API
+// API-level errors
 #define CCL_ELOGSTRUCT     0x10
 #define CCL_ELOGSTATE      0x11
 #define CCL_EREADONLY      0x12
 #define CCL_EMSGSIZE       0x13
 #define CCL_ESIZELIMIT     0x14
 #define CCL_EBADPARAM      0x15
+#define CCL_ENOTFOUND      0x16
 
 // Errors about file incompatibility or corruption
 #define CCL_ELOGVERSION    0x30

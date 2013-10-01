@@ -57,35 +57,6 @@ bool log_resize_iovec(ccl_log_t *log, int new_count) {
 	return true;
 }
 
-bool ccl_msg_init(ccl_msg_t *msg) {
-	memset(msg, 0, sizeof(*msg));
-	return true;
-}
-
-bool ccl_msg_destroy(ccl_msg_t *msg) {
-	if (!msg->user_buffer && !msg->hot_buffer) {
-		free(msg->data);
-		msg->data= NULL;
-		msg->data_len= 0;
-		msg->buffer_len= 0;
-	}
-	return true;
-}
-
-// Resize the buffer of a message object.
-// Only allowed if the buffer is dynamic (not a view of mmapped data, and not user-allocated)
-bool msg_resize(ccl_msg_t *msg, int newsize) {
-	void* newbuf;
-	if (msg->user_buffer || msg->hot_buffer)
-		return false;
-	newbuf= realloc(msg->data, newsize);
-	if (!newbuf)
-		return false;
-	msg->data= (char*) newbuf;
-	msg->buffer_len= newsize;
-	return true;
-}
-
 bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits) {
 	if (log->fd >= 0)
 		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
@@ -545,39 +516,6 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, 
 }
 */
 
-/** ccl_seek - find the nearest message for some criteria
- *
- * Reading a CircuLog is a best-effort sort of algorithm, which runs
- * unsynchronized with the writing process, and may or may not succeed.
- * This function attempts to find the log message you were interested in,
- * though no guarantees are made as to whether the located message will
- * still exist by the time you try to read it.
- *
- * This function basically just seeks to a position, and then searches
- * through the spool looking for something which is a valid message.
- *
- * Creating a log file with the "index" feature will speed this up.
- * (not yet implemented)
- */
-bool ccl_seek(ccl_log_t *log, int mode, int64_t value) {
-	return false;
-/*	switch (mode) {
-	case CCL_SEEK_OLDEST:
-	case CCL_SEEK_RELATIVE:
-	case CCL_SEEK_NEWEST:
-	case CCL_SEEK_ADDR:
-		return 0;
-	case CCL_SEEK_LIMIT:
-		
-	case CCL_SEEK_TIME:
-		return 0;
-	default:
-		log->last_err= CCL_EPARAM;
-		log->last_errno= 0;
-		return 0;
-	}*/
-}
-
 inline int encode_size(uint64_t value, uint64_t *encoded_out) {
 	if (value >> 14) {
 		if (value >> 29) {
@@ -599,7 +537,7 @@ inline int encode_size(uint64_t value, uint64_t *encoded_out) {
 }
 
 inline int decode_size(uint64_t encoded, uint64_t *value_out) {
-	switch ((int) (encoded & 0xF)) {
+	switch ((int) (uint8_t) encoded) {
 	case 0b1111:
 		return 0;
 	case 0b0111:
@@ -607,18 +545,204 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
 		return 8;
 	case 0b0011:
 	case 0b1011:
-		*value_out= (encoded & 0xFFFFFFFF) >> 3; 
+		*value_out= ((uint32_t) encoded) >> 3; 
 		return 4;
 	case 0b0001:
 	case 0b0101:
 	case 0b1001:
 	case 0b1101:
-		*value_out= (encoded & 0xFFFF) >> 2;
+		*value_out= ((uint16_t) encoded) >> 2;
 		return 2;
 	default:
-		*value_out= (encoded & 0xFF) >> 1;
+		*value_out= ((uint8_t) encoded) >> 1;
 		return 1;
 	}
+}
+
+/** ccl_read - try to read a message (usually combined with a seek flag)
+ *
+ * Reading a CircuLog is a best-effort sort of algorithm, which runs
+ * unsynchronized with the writing process, and may or may not succeed.
+ * This function attempts to find the log message you were interested in,
+ * and read it into a buffer where you can safely work with it.  It verifies
+ * a weak checksum of the protocol prefix/suffix bytes to ensure (with only
+ * moderate certainty) that the message you read was a complete record.
+ *
+ * If no seek flag is specified, this method tries to read a message at
+ * msg->address, and fails if that is not the start of a valid message.
+ * 
+ * Upon success, ccl_read_message will return true, and set:
+ *   msg->address to the file address of the found message,
+ *   msg->timestamp to the raw 64-bit timestamp of the message,
+ *   msg->msg_len to the length, in bytes, of the message data
+ *   msg->data to a NUL-terminated string (of raw binary data)
+ *   msg->data_len to the number of bytes available in msg->data
+ *
+ * In addition, if the flag CCL_BUFFER_AUTO is requested, ccl_read_message
+ *   will automatically malloc or realloc the msg->buffer field large enough
+ *   to hold the current message and its protocol bytes, and set
+ *   msg->buffer_len to match.
+ *
+ * The msg->data pointer will be set to "" if the flag CCL_NODATA is requested,
+ * and msg->data_len to 0.
+ *
+ * Else, if msg->buffer is non-null (possibly as the result of CCL_BUFFER_AUTO)
+ * msg->data will be a pointer into msg->buffer.  msg->data_len might be less
+ * than msg->msg_len if the buffer was not large enough.  Note that the buffer
+ * needs to be *larger* than msg->msg_len to accomodate protocol bytes.
+ *
+ * Else, msg->data will be a pointer into memory owned by the log object which
+ * should not be freed or altered by the user, and will contain the entire
+ * message.
+ *
+ * Note that the writer is allowed to write raw binary data (including NUL
+ * charachers) into a message.  Use data_len instead of strlen(data) if you
+ * want to correctly handle these mesages. But for convenience, the protocol
+ * places a NUL byte at the end of every message, so you can safely operate
+ * on the data as a string if you expect your messages to be text.  Messages
+ * truncated by insufficient buffer space will also always be NUL-terminated.
+ * 
+ * Seek Flags:
+ *
+ * CCL_SEEK_ADDR searches for the nearest message to msg->address.  This can
+ * be time consuming if msg->address is not near a message boundary and the
+ * messages are large, but for "normal" sized messages, it won't be noticable.
+ *
+ * CCL_SEEK_TIME searches the log for the first message with a timestamp
+ * greater or equal to the value of msg->timestamp
+ *
+ * CCL_SEEK_OLDEST searches the log for the message with the oldest timestamp.
+ *
+ * CCL_SEEK_NEWEST searches the log for the message with the newest timestamp.
+ *
+ * CCL_SEEK_PREV tries to read a log message occuring immediately before the
+ * message at msg->address.
+ *
+ * CCL_SEEK_NEXT tries to read a log message immediately following the message
+ * at msg->address based on msg->msg_len.
+ *
+ * CCL_SEEK_RELATIVE looks at msg->offset to perform some number CCL_SEEK_PREV
+ * (negative) or CCL_SEEK_NEXT (positive).  In other words, setting msg->offset
+ * to -1 and using the flag CCL_SEEK_RELATIVE is the same as using the flag
+ * CCL_SEEK_PREV.
+ *
+ */
+bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
+	int64_t buf[2];
+	int size_len, size_len_2;
+	int64_t msg_head, msg_tail, msg_len, msg_len_2, timestamp, cksum;
+	
+	// Starting with msg->address (treated as offset within spool)
+	// try to recognize current position as a message.
+	// (but wrap address to be within the spool)
+	msg_head= msg->address;
+	if (msg_head < 0 || msg_head >= log->spool_size || msg_head & 7) {
+		msg_head= (msg_head >> 3 << 3) % log->spool_size;
+		if (msg_head < 0)
+			msg_head+= log->spool_size;
+	}
+	if (!log_seek(log, log->spool_start + msg_head))
+		return false;
+	// does the header wrap?
+	if (msg_head+16 <= log->spool_size) {
+		if (!log_read(log, buf, 16))
+			return false;
+	} else {
+		// wrap around end of spool
+		if (!log_read(log, &buf[0], 8)
+			|| !log_seek(log, log->spool_start)
+			|| !log_read(log, &buf[1], 8))
+			return false;
+	}
+	// decode message size
+	timestamp= le64toh(buf[0]);
+	size_len= decode_size( le64toh(buf[1]), &msg_len );
+	if (size_len == 0)
+		return SET_ERR(log, CCL_ENOTFOUND, "Address does not describe a valid message");
+	// Now, seek to the other end of the message and verify it.
+	msg_tail= msg_head + CCL_BYTES_NEEDED_FOR_MESSAGE(msg->msg_len, size_len) - 16;
+	if (msg_tail >= log->spool_size)
+		msg_tail -= log->spool_size;
+	if (!log_seek(log, log->spool_start + msg_tail))
+		return false;
+	if (msg_tail + 16 <= log->spool_size) {
+		if (!log_read(log, buf, 16))
+			return false;
+	} else {
+		if (!log_read(log, &buf[0], 8)
+			|| !log_seek(log, log->spool_start)
+			|| !log_read(log, &buf[1], 8))
+			return false;
+	}
+	size_len_2= decode_size( be64toh(buf[0]), &msg_len_2 );
+	if (size_len != size_len_2 || msg_len != msg_len_2)
+		return SET_ERR(log, CCL_ENOTFOUND, "Address does not describe a valid message");
+	cksum= le64toh(buf[1]);
+	if (cksum != CCL_MESSAGE_CHECKSUM(msg_len, timestamp, msg_head))
+		return SET_ERR(log, CCL_ENOTFOUND, "Address almost looked like a valid message, but wrong checksum");
+	
+	msg->address= msg_head;
+	msg->timestamp= timestamp;
+	msg->msg_len= msg_len;
+	
+}
+
+void log_parse_message(ccl_log_t *log, ccl_msg_t *msg, int64_t start_addr) {
+	// If CCL_NODATA, then use a static buffer of length 16
+	// else If flag CCL_BUFFER_AUTO, use/create buffer at least 256 bytes
+	// else if buffer specified, use it (at whatever length it is)
+	// else use log's buffer, growing as needed.
+	
+	// read 256 bytes (or less if buffer limit, but at least 16) (handle wrap at end of spool)
+	
+	// parse timestamp and size
+	// if size > max_message_size of log, or spool_size, fail.
+	
+	// If message larger than what we read, and BUFFER_AUTO or log's buffer and not NODATA,
+	// then enlarge buffer to at least message size, and read remainder.
+	// (handle wrap at end of spool)
+	
+	// If don't have end of message, seek to end and read it into a separate 16 bytes.
+	
+	// Then, check end of message to ensure size and checksum match
+}
+
+void log_parse_message_reverse(ccl_log_t *log, ccl_msg_t *msg, int64_t end_addr) {
+	// If CCL_NODATA, then use a static buffer of length 16
+	// else If flag CCL_BUFFER_AUTO, use/create buffer at least 256 bytes
+	// else if buffer specified, use it (at whatever length it is)
+	// else use log's buffer, growing as needed.
+	
+	// read 256 bytes into end of buffer (or less if buffer limit, but at least 16)
+	// (handle wrap at end of spool)
+	
+	// parse checksum and size
+	// if size > max_message_size of log, or spool_size, fail.
+	
+	// If message larger than what we read
+	//     If BUFFER_AUTO or log's buffer and not NODATA,
+	//     then enlarge buffer to at least message size, shift the data,
+	//     and read front half of message into front of buffer.
+	//     Else, read first portion of message into front of buffer.
+	
+	// Parse timestamp and size and make sure they match checksum
+}
+	
+/*	switch (mode) {
+	case CCL_SEEK_OLDEST:
+	case CCL_SEEK_RELATIVE:
+	case CCL_SEEK_NEWEST:
+	case CCL_SEEK_ADDR:
+		return 0;
+	case CCL_SEEK_LIMIT:
+		
+	case CCL_SEEK_TIME:
+		return 0;
+	default:
+		log->last_err= CCL_EPARAM;
+		log->last_errno= 0;
+		return 0;
+	}*/
 }
 
 bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp) {
