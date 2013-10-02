@@ -1,11 +1,13 @@
 #! /bin/sh
 
+set -e
+
 srcroot="`dirname "$(realpath $0)"`";
 [ -n "$srcroot" ] || exit;
 buildroot="`realpath "$PWD"`";
 [ -n "$buildroot" ] || exit;
 
-if [[ "$buildroot" == "$srcroot" ]]; then
+if [ "$buildroot" = "$srcroot" ]; then
 	echo "Building in same directory as source is not supported."
 	echo "Using subdir 'build'";
 	buildroot="$buildroot/build";
