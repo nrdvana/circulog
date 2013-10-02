@@ -42,7 +42,7 @@ typedef struct ccl_log_header_s {
 		spool_size;
 	uint32_t
 		max_message_size,
-		reserved_01;
+		checksum_algorithm;
 } ccl_log_header_t;
 
 typedef struct ccl_log_header_s ccl_log_header_v0;
@@ -77,10 +77,10 @@ typedef struct ccl_log_index_entry_s {
  * ( size message padding reverse_size ) timestamp checksum
  *
  * where
+ *   - 'message' is a string of text (or raw binary data)
  *   - 'size' is the length of 'message' in bytes, written as a
  *     variable-length integer.
  *   - 'reverse_size' is the same as 'size', but with the bytes swapped
- *   - 'message' is a string of text (or raw binary data)
  *   - 'padding' is 1 to 8 NUL bytes, aligning the timestamp to multiple of 8
  *     bytes, and also NUL terminating the message.
  *   - 'timestamp' is uint64_t and is relative to log.timestamp_epoch
@@ -91,7 +91,7 @@ typedef struct ccl_log_index_entry_s {
 
 // Weak checksum... but saves us from processing the whole message,
 // and should be good enough to prevent accidentally accepting a half-written message
-#define CCL_MESSAGE_CHECKSUM(datalen, timestamp, start_address) \
+#define CCL_MESSAGE_LENGTH_CHECKSUM(datalen, timestamp, start_address) \
 	((((start_address)>>3)*0x0505050505050505LL) ^ ((timestamp)*0x1000010000100001LL) ^ ((datalen)*0x9009009009009LL))
 
 #define CCL_NSEC_TO_FRAC32(nsec) ((((uint64_t)(nsec)) * ((1ULL<<62)/1000000000)) >> 30)
@@ -114,6 +114,7 @@ typedef struct ccl_log_s {
 	int timestamp_precision;
 	int64_t timestamp_epoch;
 	int max_message_size;
+	int checksum_algo;
 	off_t index_start,
 		index_size,
 		spool_start,
@@ -124,7 +125,7 @@ typedef struct ccl_log_s {
 	bool writeable: 1,
 		shared_write: 1;
 	int fd;
-	void *memmap;
+	volatile char *memmap;
 	size_t memmap_size;
 	int iovec_count;
 	struct iovec *iovec_buf;

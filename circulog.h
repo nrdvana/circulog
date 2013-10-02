@@ -24,6 +24,8 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 #define CCL_SHARE  2
 #define CCL_CREATE 4
 
+#define CCL_CK_METAONLY  0x4154454d
+
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
 extern bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp);
@@ -50,7 +52,6 @@ typedef struct ccl_msg_s {
 	int data_len;
 	char *buffer;
 	int buffer_len;
-	int offset;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);
@@ -62,7 +63,6 @@ extern bool ccl_msg_destroy(ccl_msg_t *msg);
 #define CCL_SEEK_NEWEST   0x0003
 #define CCL_SEEK_PREV     0x0004
 #define CCL_SEEK_NEXT     0x0005
-#define CCL_SEEK_RELATIVE 0x0006
 #define CCL_SEEK_MASK     0x000F
 #define CCL_BUFFER_AUTO   0x0100
 #define CCL_NODATA        0x0200

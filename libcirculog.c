@@ -29,6 +29,7 @@ bool ccl_init(ccl_log_t *log, int struct_size) {
 	log->max_message_size=    CCL_DEFAULT_MAX_MESSAGE_SIZE;
 	log->index_size=          1;
 	log->spool_size=          CCL_DEFAULT_SPOOL_SIZE;
+	log->checksum_algo=       CCL_CK_METAONLY;
 	log->fd= -1;
 	return true;
 }
@@ -73,6 +74,20 @@ bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_inde
 	log->spool_size= spool_size;
 	log->index_size= with_index? 1 : 0;
 	log->max_message_size= max_message_size;
+	return true;
+}
+
+bool ccl_init_checksum(ccl_log_t *log, int checksum_algo) {
+	if (log->fd >= 0)
+		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
+	
+	switch (checksum_algo) {
+	 case CCL_CK_METAONLY:
+		log->checksum_algo= checksum_algo;
+		break;
+	 default:
+		return SET_ERR(log, CCL_EBADPARAM, "invalid checksum algorithm");
+	}
 	return true;
 }
 
@@ -236,16 +251,17 @@ static bool log_create_file(ccl_log_t *log) {
 	
 	memset(&header, 0, sizeof(header));
 	header.magic=                 htole64(CCL_HEADER_MAGIC);
-	header.version=               htole32(CCL_CURRENT_VERSION);
-	header.oldest_compat_version= htole32(CCL_CURRENT_VERSION);
-	header.header_size=           htole32(sizeof(header));
-	header.timestamp_precision=   htole32(log->timestamp_precision);
+	header.version=               htole32((int32_t)CCL_CURRENT_VERSION);
+	header.oldest_compat_version= htole32((int32_t)CCL_CURRENT_VERSION);
+	header.header_size=           htole32((int32_t)sizeof(header));
+	header.timestamp_precision=   htole32((int32_t)log->timestamp_precision);
 	header.timestamp_epoch=       htole64(log->timestamp_epoch);
 	header.index_start=           htole64(index_start);
 	header.index_size=            htole64(index_size);
 	header.spool_start=           htole64(spool_start);
 	header.spool_size=            htole64(spool_size);
-	header.max_message_size=      htole32(log->max_message_size);
+	header.max_message_size=      htole32((int32_t)log->max_message_size);
+	header.checksum_algorithm=    htole32((int32_t)log->checksum_algo);
 	
 	file_size= spool_start+spool_size;
 	
@@ -311,11 +327,13 @@ static bool log_load_file(ccl_log_t *log) {
 	log->spool_start=         le64toh(header.spool_start);
 	log->spool_size=          le64toh(header.spool_size);
 	log->max_message_size=    le32toh(header.max_message_size);
+	log->checksum_algo=       le32toh(header.checksum_algorithm);
 	
 	// Now it is safe to use the rest of the header fields we know about
 	
 	if ((uint64_t)file_size < log->spool_start + log->spool_size)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile is truncated (file size less than end of message spool)");
+	
 	if (log->index_start < log->header_size)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile index overlaps with header");
 	if (log->index_size) {
@@ -325,12 +343,21 @@ static bool log_load_file(ccl_log_t *log) {
 		if (index_entries != (log->spool_size + CCL_INDEX_GRANULARITY-1) >> CCL_INDEX_GRANULARITY_BITS)
 			return SET_ERR(log, CCL_ELOGINVAL, "$logfile index size does not match spool size");
 	}
+	
 	if (log->spool_start < log->index_start + log->index_size)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool overlaps with index");
 	if (log->spool_size & 7)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool size is not a multiple of 8");
+	
 	if (log->timestamp_precision < 0 || log->timestamp_precision > 64)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile timestamp precision outside valid range");
+	
+	switch (log->checksum_algo) {
+	 case CCL_CK_METAONLY:
+		break;
+	 default:
+		return SET_ERR(log, CCL_ELIGINVAL, "$logfile uses unknown checksum algorithm");
+	}
 	
 	// Lock it for writing, if write-exclusive mode.
 	// In shared-write mode, we lock on each write operation.
@@ -516,6 +543,18 @@ bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, 
 }
 */
 
+/** Encode a number as a variable number of bytes, within an int64.
+ *
+ * 0..0x7F use one byte, and are shifted left (given a low 0 bit)
+ * 0x80..0x3FFF use 2 bytes, and are shifted left 2 (given low bits 01)
+ * 0x4000..0x1FFFFFFF use 4 bytes, and are shifted left 3 (given low bits 011)
+ * 0x20000000..0x0FFFFFFFFFFFFFFF use 8 bytes and are shifted left 4 (given low bits 0111)
+ * Numbers greater than this are not currently supported (or needed), though they would
+ * continue the pattern of doubling the width and adding a low-order 1-bit.
+ *
+ * Returns the number of *bytes* used.  Returns the encoded number in encoded_out,
+ * in the low-order bits.
+ */
 inline int encode_size(uint64_t value, uint64_t *encoded_out) {
 	if (value >> 14) {
 		if (value >> 29) {
@@ -536,6 +575,15 @@ inline int encode_size(uint64_t value, uint64_t *encoded_out) {
 	}
 }
 
+/** Decode a number previously encoded by encode_size.
+ * See encode_size() for encoding details.
+ *
+ * The original size is stored in value_out, as a plain 64-bit int.
+ *
+ * Returns the number of *bytes* the size occupied within 'encoded', or 0 if
+ * the size was larger than 64-bit (not supported by this implementation,
+ * and likely invalid)
+ */
 inline int decode_size(uint64_t encoded, uint64_t *value_out) {
 	switch ((int) (uint8_t) encoded) {
 	case 0b1111:
@@ -597,7 +645,7 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
  *
  * Note that the writer is allowed to write raw binary data (including NUL
  * charachers) into a message.  Use data_len instead of strlen(data) if you
- * want to correctly handle these mesages. But for convenience, the protocol
+ * want to correctly handle these messages. But for convenience, the protocol
  * places a NUL byte at the end of every message, so you can safely operate
  * on the data as a string if you expect your messages to be text.  Messages
  * truncated by insufficient buffer space will also always be NUL-terminated.
@@ -621,16 +669,17 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
  * CCL_SEEK_NEXT tries to read a log message immediately following the message
  * at msg->address based on msg->msg_len.
  *
- * CCL_SEEK_RELATIVE looks at msg->offset to perform some number CCL_SEEK_PREV
+ * CCL_SEEK_RELATIVE looks at msg->offset to perform some number of CCL_SEEK_PREV
  * (negative) or CCL_SEEK_NEXT (positive).  In other words, setting msg->offset
  * to -1 and using the flag CCL_SEEK_RELATIVE is the same as using the flag
- * CCL_SEEK_PREV.
+ * CCL_SEEK_PREV. -5 means perform CCL_SEEK_PREV 5 times.
  *
  */
 bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 	int64_t buf[2];
 	int size_len, size_len_2;
-	int64_t msg_head, msg_tail, msg_len, msg_len_2, timestamp, cksum;
+	int64_t msg_head, msg_tail, timestamp, cksum;
+	uint64_t msg_len, msg_len_2;
 	
 	// Starting with msg->address (treated as offset within spool)
 	// try to recognize current position as a message.
@@ -681,68 +730,188 @@ bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 	if (cksum != CCL_MESSAGE_CHECKSUM(msg_len, timestamp, msg_head))
 		return SET_ERR(log, CCL_ENOTFOUND, "Address almost looked like a valid message, but wrong checksum");
 	
-	msg->address= msg_head;
+	msg->address=   msg_head;
 	msg->timestamp= timestamp;
-	msg->msg_len= msg_len;
-	
+	msg->msg_len=   msg_len;
+
+
+	if (flags & CCL_BUFFER_AUTO) {
+		if (msg->buffer_len < 256) {
+			buffer= (char*) realloc(msg->buffer, 256);
+			if (!buffer)
+				return SET_ERR(log, CCL_ESYSERR, "Can't allocate read buffer");
+			msg->buffer= buffer;
+			buffer_len= msg->buffer_len= 256;
+		}
+	}
 }
 
-void log_parse_message(ccl_log_t *log, ccl_msg_t *msg, int64_t start_addr) {
-	// If CCL_NODATA, then use a static buffer of length 16
-	// else If flag CCL_BUFFER_AUTO, use/create buffer at least 256 bytes
-	// else if buffer specified, use it (at whatever length it is)
-	// else use log's buffer, growing as needed.
+/** Identify whether a message might exist at start_addr.
+ *
+ * This function determines whether there is a valid start/end marker
+ * beginning at the specified address, and if so, what its end_addr
+ * and timestamp are.  Returns a boolean of whether it succeeded.
+ *
+ * log - a log object, in an open state
+ * start_addr - the starting address (offset from log's spool_start)
+ * end_addr_out - (optional) pointer to receive the address immediately after the message
+ * timestamp_out - (optional) pointer to receive the timestamp of the message
+ * 
+ */
+bool log_probe_msgstart(ccl_log_t *log, int64_t start_addr, int64_t *end_addr_out, int64_t *timestamp_out) {
+	int64_t msglen, msglen2, first_word, last_word, end_addr;
+	int size_size, size_size2;
+
+	// sanity checks
+	if (!log->memmap)
+		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
+	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
+		return SET_ERR(log, CCL_EBADPARAM, "Invalid start_addr");
 	
-	// read 256 bytes (or less if buffer limit, but at least 16) (handle wrap at end of spool)
+	// read the start of the message (containing size)
+	first_word= * (int64_t*) (log->memmap + log->spool_start + start_addr + 8);
+	size_size= decode_size( le64toh(first_word), &msglen );
+	if (!(size_size > 0 && msglen > 0 && msglen <= log->spool_size && msglen <= log->max_message_size))
+		return SET_ERR(log, CCL_ENOTFOUND, "Bad msglen");
 	
-	// parse timestamp and size
-	// if size > max_message_size of log, or spool_size, fail.
+	// go to end of message and see if size matches
+	end_addr= start_addr + CCL_BYTES_NEEDED_FOR_MESSAGE(msglen, size_size);
+	if (end_addr > log->spool_size)
+		end_addr -= log->spool_size;
+	last_word= * (int64_t*) (log->memmap + log->spool_start + log->spool_size + end_addr - 16 );
+	size_size2= decode_size( be64toh(last_word), &msglen2 );
+	if (size_size != size_size2 || msglen != msglen2)
+		return SET_ERR(log, CCL_ENOTFOUND, "No matching msglen at end");
 	
-	// If message larger than what we read, and BUFFER_AUTO or log's buffer and not NODATA,
-	// then enlarge buffer to at least message size, and read remainder.
-	// (handle wrap at end of spool)
-	
-	// If don't have end of message, seek to end and read it into a separate 16 bytes.
-	
-	// Then, check end of message to ensure size and checksum match
+	// found a possible message.  give caller what they asked for.
+	if (end_addr_out)
+		*end_addr_out= end_addr;
+	if (timestamp_out)
+		*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+	return true;
 }
 
-void log_parse_message_reverse(ccl_log_t *log, ccl_msg_t *msg, int64_t end_addr) {
-	// If CCL_NODATA, then use a static buffer of length 16
-	// else If flag CCL_BUFFER_AUTO, use/create buffer at least 256 bytes
-	// else if buffer specified, use it (at whatever length it is)
-	// else use log's buffer, growing as needed.
+/** Like log_probe_msgstart, but probes from end address and determines start address.
+ *
+ * end_addr - the address (offset within spool) immediately beyond the suspected message.
+ */
+bool log_probe_msgend(ccl_log_t *log, int64_t end_addr, int64_t *start_addr_out, int64_t *timestamp_out) {
+	int64_t msglen, msglen2, first_word, last_word, start_addr;
+	int size_size, size_size2;
 	
-	// read 256 bytes into end of buffer (or less if buffer limit, but at least 16)
-	// (handle wrap at end of spool)
+	// sanity checks
+	if (!log->memmap)
+		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
+	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
+		return SET_ERR(log, CCL_EBADPARAM, "Invalid end_addr");
 	
-	// parse checksum and size
-	// if size > max_message_size of log, or spool_size, fail.
+	// read the end of the message (containing size)
+	last_word= * (int64_t*) (log->memmap + log->spool_start + log->spool_size + end_addr - 16);
+	size_size= decode_size( be64toh(last_word), &msglen );
+	if (size_size <= 0 || msglen <= 0 || msglen > log->spool_size || msglen > log->max_message_size)
+		return SET_ERR(log, CCL_ENOTFOUND, "Bad msglen");
 	
-	// If message larger than what we read
-	//     If BUFFER_AUTO or log's buffer and not NODATA,
-	//     then enlarge buffer to at least message size, shift the data,
-	//     and read front half of message into front of buffer.
-	//     Else, read first portion of message into front of buffer.
+	// go to start of message and see if size matches
+	start_addr= end_addr - CCL_BYTES_NEEDED_FOR_MESSAGE(msglen, size_size);
+	if (start_addr < 0)
+			start_addr += log->spool_size;
+	first_word= * (int64_t*) (log->memmap + log->spool_start + start_addr + 8);
+	size_size2= decode_size( le64toh(first_word), &msglen2 );
+	if (size_size != size_size2 || msglen != msglen2)
+		return SET_ERR(log, CCL_ENOTFOUND, "No matching msglen at start");
 	
-	// Parse timestamp and size and make sure they match checksum
+	// found a possible message.  give caller what they asked for
+	if (start_addr_out)
+		*start_addr_out= start_addr;
+	if (timestamp_out)
+		*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+	return true;
 }
+
+/** Loads a message from the specified address range, and stores it in msg.
+ *
+ * A message must be copied out of the memmap in order to protect from
+ * concurrent writes.  This function copies the range of the log's spool,
+ * and then tries to validate that the message is not corrupted, using
+ * whatever checksum algorithm the log is using.
+ *
+ * If the buffer in msg is not large enough, it copies what it can, and
+ * returns false with an error code of CCL_ESIZELIMIT, which also means that
+ * the message has not been validated!
+ */
+bool log_load_message(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg) {
+	int64_t msgbytes, msglen, msglen2, timestamp;
+	uint64_t cksum;
+	int size, size2, n;
 	
-/*	switch (mode) {
-	case CCL_SEEK_OLDEST:
-	case CCL_SEEK_RELATIVE:
-	case CCL_SEEK_NEWEST:
-	case CCL_SEEK_ADDR:
-		return 0;
-	case CCL_SEEK_LIMIT:
+	// sanity checks
+	if (!log->memmap)
+		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
+	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
+		return SET_ERR(log, CCL_EBADPARAM, "invalid start_addr");
+	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
+		return SET_ERR(log, CCL_EBADPARAM, "invalid end_addr");
+	
+	// un-wrap end_addr
+	if (end_addr < start_addr)
+		end_addr += log->spool_size;
+	// figure size of message + timestamp & checksum
+	msgbytes= end_addr - start_addr;
+	if (msgbytes < 24)
+		return SET_ERR(log, CCL_EBADPARAM, "invalid message length");
+	
+	// if we can't fit it all in the buffer, return part of it, but return false
+	//  because we couldn't validate it.
+	if (msgbytes > msg->buffer_len) {
+		// but can't do anything unless we have at least 16 bytes
+		if (msg->buffer_len < 16)
+			return SET_ERR(log, CCL_EBADPARAM, "msg->buffer too small");
+		n= msg->buffer_len;
+	} else {
+		n= (int) msgbytes;
+	}
+	
+	// Copy it from the memmap
+	memcpy(log->memmap + log->spool_start + start_addr, msg->buffer, n);
+	size= decode_size(* (int64_t*) (msg->buffer+8), &msglen);
+	if (size == 0 || msglen > log->max_message_size)
+		return SET_ERR(log, CCL_ELOGINVAL, "invalid message length");
+	timestamp= le64toh(* (int64_t*) msg->buffer);
+	
+	// if we have the whole message, verify the length and checksum
+	if (msgbytes == n) {
+		// length at end should match length at start
+		size2= decode_size(* (int64_t*) (msg->buffer + n - 16), &msglen2);
+		if (size != size2 || msglen2 != msglen)
+			return SET_ERR(log, CCL_ELOGINVAL, "invalid message");
 		
-	case CCL_SEEK_TIME:
-		return 0;
-	default:
-		log->last_err= CCL_EPARAM;
-		log->last_errno= 0;
-		return 0;
-	}*/
+		// verify checksum
+		cksum= * (uint64_t*) (msg->buffer + n - 8);
+		if (log->checksum_algo == CCL_CK_LENGTHONLY) {
+			if (cksum != CCL_MESSAGE_LENGTH_CHECKSUM(msglen, timestamp, start_addr))
+				return SET_ERR(log, CCL_ELOGINVAL, "invalid message checksum");
+		}
+		
+		msg->data_len= (int) msglen;
+	} else { // else figure out how much of the data we have
+		have= n - 8 - size;
+		if (msglen < have)
+			msg->data_len= (int) msglen;
+		// also, we're under contract for data to be nul-terminated
+		else {
+			assert(msg->data + have == msg->buffer + msg->buffer_len);
+			msg->data_len= have - 1;
+			msg->data[have - 1]= '\0';
+		}
+	}
+	
+	// fill the fields of the message object
+	msg->address= start_addr;
+	msg->timestamp= timestamp;
+	msg->msg_len= msglen;
+	msg->data= msg->buffer + 8 + size;
+	
+	return (msgbytes == n)? true : SET_ERR(log, CCL_ESIZELIMIT, "msg->buffer too small");
 }
 
 bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp) {
