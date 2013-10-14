@@ -52,6 +52,8 @@ typedef struct ccl_msg_s {
 	int data_len;
 	char *buffer;
 	int buffer_len;
+	int32_t data_cksum;
+	int32_t meta_cksum;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);

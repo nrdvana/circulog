@@ -91,8 +91,13 @@ typedef struct ccl_log_index_entry_s {
 
 // Weak checksum... but saves us from processing the whole message,
 // and should be good enough to prevent accidentally accepting a half-written message
-#define CCL_MESSAGE_LENGTH_CHECKSUM(datalen, timestamp, start_address) \
-	((((start_address)>>3)*0x0505050505050505LL) ^ ((timestamp)*0x1000010000100001LL) ^ ((datalen)*0x9009009009009LL))
+#define CCL_MESSAGE_META_CHECKSUM(datalen, timestamp, start_address) \
+	( (uint32_t) ( \
+		(uint32_t)((start_address)>>3) * (uint32_t)3 \
+		+ (uint32_t)((timestamp)) * (uint32_t)5 \
+		+ (uint32_t)((timestamp)>>32) * (uint32_t)7 \
+		+ (uint32_t)((datalen)) * (uint32_t)11 \
+	) )
 
 #define CCL_NSEC_TO_FRAC32(nsec) ((((uint64_t)(nsec)) * ((1ULL<<62)/1000000000)) >> 30)
 #define CCL_FRAC32_TO_NSEC(frac) ((long) (((frac) * 1000000000ULL + 0x80000000ULL) >> 32))
@@ -138,5 +143,10 @@ typedef struct ccl_log_s {
 } ccl_log_t;
 
 #include "circulog.h"
+
+bool log_probe_msgstart(ccl_log_t *log, int64_t start_addr, int64_t *end_addr_out, int64_t *timestamp_out);
+bool log_probe_msgend(ccl_log_t *log, int64_t end_addr, int64_t *start_addr_out, int64_t *timestamp_out);
+bool log_load_message(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg);
+bool log_load_message_nodata(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg);
 
 #endif
