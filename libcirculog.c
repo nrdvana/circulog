@@ -1,5 +1,5 @@
 #include "config.h"
-#include "circulog_internal.h"
+#include "libcirculog.h"
 
 static inline bool SET_ERR(ccl_log_t *log, int code, const char* msg) {
 	log->last_err= code;

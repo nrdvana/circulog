@@ -1,12 +1,9 @@
 srcdir:=$(srcroot)
 
-targets = libcirculog circulog cltail
+targets = libcirculog circulog-util
 
-circulog_src = circulog.c version.c
-circulog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(circulog_src))) libcirculog.a
-
-cltail_src = cltail.c
-cltail_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(cltail_src))) libcirculog.a
+circulog_util_src = circulog-util.c
+circulog_util_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(circulog_util_src))) libcirculog.a
 
 libcirculog_src = libcirculog.c
 libcirculog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(libcirculog_src)))
@@ -21,11 +18,8 @@ include $(srcroot)/make/global.mk
 
 $(circulog_objs) $(cltail_objs): Makefile $(srcroot)/make/global.mk
 
-circulog: $(circulog_objs)
-	$(LINK) -o $@ $(circulog_objs) $(LIBS)
-
-cltail: $(cltail_objs)
-	$(LINK) -o $@ $(cltail_objs) $(LIBS)
+circulog-util: circulog-util.version $(circulog_util_objs)
+	$(LINK) -o $@ $(circulog_util_objs) $(LIBS)
 
 libcirculog: libcirculog.a libcirculog.so.0.0.0
 
@@ -44,7 +38,7 @@ install: $(targets)
 	$(INST) -m 555 -o root -g root -s cltail $(DESTDIR)/bin/cltail
 
 t: $(srcdir)/t
-	ln -sf $(srcdir)/t t
+	[ -l t ] && rm t; ln -sf $(srcdir)/t t
 
 clean:
 	rm *.o
