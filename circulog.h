@@ -49,11 +49,13 @@ typedef struct ccl_msg_s {
 	int64_t timestamp;
 	int64_t msg_len;
 	const char *data;
-	int data_len;
+	size_t data_len;
 	char *buffer;
-	int buffer_len;
-	int32_t data_cksum;
-	int32_t meta_cksum;
+	size_t buffer_len;
+	int flags;
+	int data_type;
+	int data_cksum_type;
+	int level;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);

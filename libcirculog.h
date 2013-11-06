@@ -42,7 +42,7 @@ typedef struct ccl_log_header_s {
 		spool_size;
 	uint32_t
 		max_message_size,
-		checksum_algorithm;
+		reserved_1;
 } ccl_log_header_t;
 
 typedef struct ccl_log_header_s ccl_log_header_v0;
@@ -74,35 +74,67 @@ typedef struct ccl_log_index_entry_s {
 /* Format of a log message
  * (can't be represented as a plain C struct)
  * 
- * ( size message padding reverse_size ) timestamp checksum
+ * [8] timestamp
+ * [1..8] size
+ *        message
+ *        padding
+ *        data_cksum
+ * [1..8] reverse_size
+ * [1] msg_type
+ * [1] cksumtype (bits 0..3), msglevel (bits 4..7)
+ * [2] flags (reserved)
+ * [4] meta_checksum
  *
  * where
- *   - 'message' is a string of text (or raw binary data)
- *   - 'size' is the length of 'message' in bytes, written as a
+ *   - 'timestamp' is uint64_t and is relative to log.timestamp_epoch
+ *   - 'message' is a string of text (or raw binary data) possibly *including* a checksum
+ *   - 'size' is the length of the data in parenthesees, in bytes, written as a
  *     variable-length integer.
  *   - 'reverse_size' is the same as 'size', but with the bytes swapped
- *   - 'padding' is 1 to 8 NUL bytes, aligning the timestamp to multiple of 8
- *     bytes, and also NUL terminating the message.
- *   - 'timestamp' is uint64_t and is relative to log.timestamp_epoch
- *   - 'checksum' is uint64_t, and calculated by CCL_MESSAGE_CHECKSUM, which
- *     actually doesn't checksum the message at all, only the metadata
- *
+ *   - 'padding' is 1 to 8 NUL bytes, aligning the message payload to multiple of 8
+ *       bytes, and also NUL terminating the message.
+ *   - 'data_cksum' is a number of bytes (possibly 0) determined by cksumtype field.
+ *   - 'msgtype' is a byte identifying the type of data in the message.
+ *       0  - user-defined opaque bytes, user-defined flags.  utilities should display as hexdump.
+ *       1  - UTF-8 text
+ *       2  - UTF-8 JSON data
+ *   - 'cksumtype' identifies which checksum was used for the message data
+ *       0  - no checksum
+ *       1  - CRC32 (4 byte checksum)
+ *       2  - CRC64 (8 byte checksum)
+ *       3  - SHA-1 (20 byte checksum)
+ *   - 'msglevel' describes the priority of a message, as 0 (low) to 15 (high)
+ *     A suggested mapping from msglevel to syslog constants is:
+ *         >= 0xF : EMERG
+ *         >= 0xE : ALERT
+ *         >= 0xC : CRIT
+ *         >= 0xA : ERR
+ *         >= 0x8 : WARNING
+ *         >= 0x6 : NOTICE
+ *         >= 0x4 : INFO
+ *         <= 0x3 : DEBUG
+ *   - 'flags' are reserved for now, and should be 0 for msgtype other than 0.
+ *   - 'meta_cksum' is uint32_t calculated by some simple math on the metadata bytes.
+ *      (the address of the message, timestamp, size, and the 4 preceeding metadata bytes)
+ *     It is used as a rough first guess of whether the message is valid, or if the
+ *     user wants to navigate messages without fully reading each one.
  */
 
 // Weak checksum... but saves us from processing the whole message,
 // and should be good enough to prevent accidentally accepting a half-written message
-#define CCL_MESSAGE_META_CHECKSUM(datalen, timestamp, start_address) \
+#define CCL_MESSAGE_META_CHECKSUM(start_address, datalen, timestamp, info) \
 	( (uint32_t) ( \
 		(uint32_t)((start_address)>>3) * (uint32_t)3 \
 		+ (uint32_t)((timestamp)) * (uint32_t)5 \
 		+ (uint32_t)((timestamp)>>32) * (uint32_t)7 \
 		+ (uint32_t)((datalen)) * (uint32_t)11 \
+		+ (uint32_t)((info)) * (uint32_t)13 \
 	) )
 
 #define CCL_NSEC_TO_FRAC32(nsec) ((((uint64_t)(nsec)) * ((1ULL<<62)/1000000000)) >> 30)
 #define CCL_FRAC32_TO_NSEC(frac) ((long) (((frac) * 1000000000ULL + 0x80000000ULL) >> 32))
 
-// sizeof_size * 2 + size + sizeof(timestamp) + sizeof(checksum) + padding of 1 to 8 bytes
+// sizeof_size * 2 + size + 8 /*timestamp*/ + 4 /*meta*/ + 4 /*checksum*/ + padding of 1 to 8 bytes
 #define CCL_BYTES_NEEDED_FOR_MESSAGE(size, sizeof_size) ( ( ( (((sizeof_size)<<1)+(size)) >> 3) + 3) << 3)
 
 /** ccl_log_t: circulog object representing an open log.

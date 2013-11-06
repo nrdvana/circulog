@@ -77,20 +77,6 @@ bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_inde
 	return true;
 }
 
-bool ccl_init_checksum(ccl_log_t *log, int checksum_algo) {
-	if (log->fd >= 0)
-		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
-	
-	switch (checksum_algo) {
-	 case CCL_CK_METAONLY:
-		log->checksum_algo= checksum_algo;
-		break;
-	 default:
-		return SET_ERR(log, CCL_EBADPARAM, "invalid checksum algorithm");
-	}
-	return true;
-}
-
 uint64_t ccl_timestamp_from_timespec(ccl_log_t *log, struct timespec *t) {
 	#ifdef _POSIX_TIMERS
 	struct timespec t2;
@@ -133,6 +119,12 @@ static bool log_read(ccl_log_t *log, void* record, int record_size) {
 			return SET_ERR(log, CCL_EEOF, "unexpected EOF");
 	}
 	return true;
+}
+
+static inline bool log_readspool(ccl_log_t *log, off_t offset, void *record, int record_size) {
+	if (!log_seek(log, log->spool_start + offset))
+		return false;
+	return log_read(log, record, record_size);
 }
 
 static bool log_write(ccl_log_t *log, void* record, int record_size) {
@@ -206,7 +198,7 @@ static bool log_unlock(ccl_log_t *log) {
 	
 	ret= fcntl(log->fd, F_SETLK, &lock);
 	if (ret < 0)
-		return SET_ERR(log, CCL_ELOCK, "Failed to lock logfile for writing: $syserr");
+		return SET_ERR(log, CCL_ELOCK, "Failed to unlock logfile: $syserr");
 	return true;
 }
 
@@ -261,7 +253,6 @@ static bool log_create_file(ccl_log_t *log) {
 	header.spool_start=           htole64(spool_start);
 	header.spool_size=            htole64(spool_size);
 	header.max_message_size=      htole32((int32_t)log->max_message_size);
-	header.checksum_algorithm=    htole32((int32_t)log->checksum_algo);
 	
 	file_size= spool_start+spool_size;
 	
@@ -327,7 +318,6 @@ static bool log_load_file(ccl_log_t *log) {
 	log->spool_start=         le64toh(header.spool_start);
 	log->spool_size=          le64toh(header.spool_size);
 	log->max_message_size=    le32toh(header.max_message_size);
-	log->checksum_algo=       le32toh(header.checksum_algorithm);
 	
 	// Now it is safe to use the rest of the header fields we know about
 	
@@ -351,13 +341,6 @@ static bool log_load_file(ccl_log_t *log) {
 	
 	if (log->timestamp_precision < 0 || log->timestamp_precision > 64)
 		return SET_ERR(log, CCL_ELOGINVAL, "$logfile timestamp precision outside valid range");
-	
-	switch (log->checksum_algo) {
-	 case CCL_CK_METAONLY:
-		break;
-	 default:
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile uses unknown checksum algorithm");
-	}
 	
 	// Lock it for writing, if write-exclusive mode.
 	// In shared-write mode, we lock on each write operation.
@@ -615,6 +598,8 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
  * and read it into a buffer where you can safely work with it.  It verifies
  * a weak checksum of the protocol prefix/suffix bytes to ensure (with only
  * moderate certainty) that the message you read was a complete record.
+ * If your messages are flagged as having data-checksums, then the data is
+ * checked and you get much higher certainty that you have a complete record.
  *
  * If no seek flag is specified, this method tries to read a message at
  * msg->address, and fails if that is not the start of a valid message.
@@ -622,9 +607,13 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
  * Upon success, ccl_read_message will return true, and set:
  *   msg->address to the file address of the found message,
  *   msg->timestamp to the raw 64-bit timestamp of the message,
- *   msg->msg_len to the length, in bytes, of the message data
+ *   msg->msg_len to the length, in bytes (not counting NUL padding) of the message data
  *   msg->data to a NUL-terminated string (of raw binary data)
  *   msg->data_len to the number of bytes available in msg->data
+ *   msg->data_type to the byte-code indicating the message's type
+ *   msg->data_cksum_type to the code of the checksum algorithm for the message
+ *   msg->flags to the 16-bit flags of the message
+ *   msg->level to the priority (low=0 .. high=15) of the message
  *
  * In addition, if the flag CCL_BUFFER_AUTO is requested, ccl_read_message
  *   will automatically malloc or realloc the msg->buffer field large enough
@@ -638,10 +627,6 @@ inline int decode_size(uint64_t encoded, uint64_t *value_out) {
  * msg->data will be a pointer into msg->buffer.  msg->data_len might be less
  * than msg->msg_len if the buffer was not large enough.  Note that the buffer
  * needs to be *larger* than msg->msg_len to accomodate protocol bytes.
- *
- * Else, msg->data will be a pointer into memory owned by the log object which
- * should not be freed or altered by the user, and will contain the entire
- * message.
  *
  * Note that the writer is allowed to write raw binary data (including NUL
  * charachers) into a message.  Use data_len instead of strlen(data) if you
@@ -747,35 +732,60 @@ bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
  * 
  */
 bool log_probe_msgstart(ccl_log_t *log, int64_t start_addr, int64_t *end_addr_out, int64_t *timestamp_out) {
-	uint64_t msglen= 0, msglen2= 0, first_word, last_word, end_addr;
+	uint64_t msglen= 0, msglen2= 0, first_word, last_word;
+	int64_t size_addr;
 	int size_size, size_size2;
 
 	// sanity checks
-	if (!log->memmap)
-		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
 	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
 		return SET_ERR(log, CCL_EBADPARAM, "Invalid start_addr");
 	
 	// read the start of the message (containing size)
-	first_word= * (int64_t*) (log->memmap + log->spool_start + start_addr + 8);
+	size_addr= start_addr + 8;
+	if (size_addr + 8 >= log->spool_size)
+		size_addr-= 8;
+	
+	if (log->memmap) {
+		first_word= * (int64_t*) (log->memmap + log->spool_start + size_addr);
+	} else {
+		if (!log_readspool(log, size_addr, &first_word, 8))
+			return false;
+	}
+	
 	size_size= decode_size( le64toh(first_word), &msglen );
 	if (!(size_size > 0 && msglen > 0 && msglen <= log->spool_size && msglen <= log->max_message_size))
 		return SET_ERR(log, CCL_ENOTFOUND, "Bad msglen");
 	
 	// go to end of message and see if size matches
-	end_addr= start_addr + CCL_BYTES_NEEDED_FOR_MESSAGE(msglen, size_size);
-	if (end_addr > log->spool_size)
-		end_addr -= log->spool_size;
-	last_word= * (int64_t*) (log->memmap + log->spool_start + log->spool_size + end_addr - 16 );
+	size_addr= start_addr + CCL_BYTES_NEEDED_FOR_MESSAGE(msglen, size_size) - 16;
+	if (size_addr >= log->spool_size)
+		size_addr -= log->spool_size;
+	
+	if (log->memmap) {
+		last_word= * (int64_t*) (log->memmap + log->spool_start + size_addr);
+	} else {
+		if (!log_readspool(log, size_addr, &last_word, 8))
+			return false;
+	}
+	
 	size_size2= decode_size( be64toh(last_word), &msglen2 );
 	if (size_size != size_size2 || msglen != msglen2)
 		return SET_ERR(log, CCL_ENOTFOUND, "No matching msglen at end");
 	
 	// found a possible message.  give caller what they asked for.
-	if (end_addr_out)
-		*end_addr_out= end_addr;
-	if (timestamp_out)
-		*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+	if (end_addr_out) {
+		*end_addr_out= size_addr + 16;
+		if (*end_addr_out > log->spool_size)
+			*end_addr_out-= log->spool_size;
+	}
+	if (timestamp_out) {
+		if (log->memmap) {
+			*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+		} else {
+			if (!log_readspool(log, start_addr, timestamp_out, 8))
+				return false;
+		}
+	}
 	return true;
 }
 
@@ -785,35 +795,60 @@ bool log_probe_msgstart(ccl_log_t *log, int64_t start_addr, int64_t *end_addr_ou
  */
 bool log_probe_msgend(ccl_log_t *log, int64_t end_addr, int64_t *start_addr_out, int64_t *timestamp_out) {
 	uint64_t msglen= 0, msglen2= 0, first_word, last_word;
-	int64_t start_addr;
+	int64_t start_addr, size_addr;
 	int size_size, size_size2;
 	
 	// sanity checks
-	if (!log->memmap)
-		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
 	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
 		return SET_ERR(log, CCL_EBADPARAM, "Invalid end_addr");
 	
 	// read the end of the message (containing size)
-	last_word= * (int64_t*) (log->memmap + log->spool_start + log->spool_size + end_addr - 16);
+	size_addr= end_addr - 16;
+	if (size_addr < 0)
+		size_addr+= log->spool_size;
+	
+	if (log->memmap) {
+		last_word= * (int64_t*) (log->memmap + log->spool_start + size_addr);
+	} else {
+		if (!log_readspool(log, size_addr, &last_word, 8))
+			return false;
+	}
+	
 	size_size= decode_size( be64toh(last_word), &msglen );
 	if (size_size <= 0 || msglen <= 0 || msglen > log->spool_size || msglen > log->max_message_size)
 		return SET_ERR(log, CCL_ENOTFOUND, "Bad msglen");
 	
 	// go to start of message and see if size matches
 	start_addr= end_addr - CCL_BYTES_NEEDED_FOR_MESSAGE(msglen, size_size);
+	size_addr= start_addr + 8;
 	if (start_addr < 0)
-			start_addr += log->spool_size;
-	first_word= * (int64_t*) (log->memmap + log->spool_start + start_addr + 8);
+		start_addr += log->spool_size;
+	if (size_addr < 0)
+		size_addr += log->spool_size;
+	
+	if (log->memmap) {
+		first_word= * (int64_t*) (log->memmap + log->spool_start + size_addr);
+	} else {
+		if (!log_readspool(log, size_addr, &last_word, 8))
+			return false;
+	}
+	
 	size_size2= decode_size( le64toh(first_word), &msglen2 );
 	if (size_size != size_size2 || msglen != msglen2)
 		return SET_ERR(log, CCL_ENOTFOUND, "No matching msglen at start");
 	
 	// found a possible message.  give caller what they asked for
-	if (start_addr_out)
+	if (start_addr_out) {
 		*start_addr_out= start_addr;
-	if (timestamp_out)
-		*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+	}
+	if (timestamp_out) {
+		if (log->memmap) {
+			*timestamp_out= * (int64_t*) (log->memmap + log->spool_start + start_addr);
+		} else {
+			if (!log_readspool(log, start_addr, timestamp_out, 8))
+				return false;
+		}
+	}
 	return true;
 }
 
@@ -831,14 +866,12 @@ bool log_probe_msgend(ccl_log_t *log, int64_t end_addr, int64_t *start_addr_out,
 bool log_load_message(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg) {
 	int64_t msgbytes, timestamp;
 	uint64_t msglen= 0, msglen2= 0;
-	uint32_t meta_cksum;
+	uint32_t meta_cksum, flagbits;
 	int size, size2, n;
 	char tail_buf[16];
 	char* tail;
 	
 	// sanity checks
-	if (!log->memmap)
-		return SET_ERR(log, CCL_EBADPARAM, "log not memmapped");
 	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
 		return SET_ERR(log, CCL_EBADPARAM, "invalid start_addr");
 	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
@@ -879,9 +912,11 @@ bool log_load_message(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_
 	if (size != size2 || msglen2 != msglen)
 		return SET_ERR(log, CCL_ELOGINVAL, "invalid message");
 	
+	flagbits= le32toh(* (uint32_t*) (tail+8));
+	
 	// verify checksum
 	meta_cksum= le32toh(* (uint32_t*) (tail+12));
-	if (meta_cksum != CCL_MESSAGE_META_CHECKSUM(msglen, timestamp, start_addr))
+	if (meta_cksum != CCL_MESSAGE_META_CHECKSUM(start_addr, msglen, timestamp, flagbits))
 		return SET_ERR(log, CCL_ELOGINVAL, "invalid message checksum");
 	
 	// fill the other fields of the message object
