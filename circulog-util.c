@@ -55,7 +55,11 @@ bool ccl_parseOptions(circulog_t* self, char** argv);
 bool ccl_processOption(circulog_t* self, char shortOpt, char* longOpt, char* optVal, char*** argvp);
 
 extern unsigned int version_number;
-extern const char* build_info;
+extern const char
+	*build_info_commit,
+	*build_info_host,
+	*build_info_date;
+#include "circulog-util.version"
 
 bool parseInt(long* dest, char* src);
 bool parseSize(long long* dest, char* src);

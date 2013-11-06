@@ -18,6 +18,18 @@ include $(srcroot)/make/global.mk
 
 $(circulog_objs) $(cltail_objs): Makefile $(srcroot)/make/global.mk
 
+circulog-util.version:
+	( \
+	export GIT_DIR="$(srcroot)/.git"; \
+	export GIT_WORK_DIR="$(srcroot)"; \
+	echo 'version_number = 0;'; \
+	echo -n "build_info_commit = \"commit `git reflog | head -n 1 | sed -e 's/ .*//'`"; \
+	git status | grep 'not staged' > /dev/null && echo -n " (modified)"; \
+	echo "\";"; \
+	echo "build_info_host = \"`hostname`\";"; \
+	echo "build_info_date = \"`date`\";"; \
+	) > circulog-util.version
+
 circulog-util: circulog-util.version $(circulog_util_objs)
 	$(LINK) -o $@ $(circulog_util_objs) $(LIBS)
 
@@ -43,4 +55,4 @@ t: $(srcdir)/t
 clean:
 	rm *.o
 
-.PHONY: all install libcirculog clean
+.PHONY: all install libcirculog clean circulog-util.version
