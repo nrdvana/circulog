@@ -75,35 +75,28 @@ typedef struct ccl_log_index_entry_s {
  * (can't be represented as a plain C struct)
  * 
  * [8] timestamp
+ * [2] 0x1E 0x01  (signature)
+ * [1] msg_type
+ * [1] msg_cksum_type (bits 0..3), msg_level (bits 4..7)
  * [1..8] size
  *        message
  *        padding
- *        data_cksum
+ *        msg_cksum (if any)
  * [1..8] reverse_size
- * [1] msg_type
- * [1] cksumtype (bits 0..3), msglevel (bits 4..7)
- * [2] flags (reserved)
- * [4] meta_checksum
+ * [4] frame_checksum
  *
  * where
- *   - 'timestamp' is uint64_t and is relative to log.timestamp_epoch
- *   - 'message' is a string of text (or raw binary data) possibly *including* a checksum
- *   - 'size' is the length of the data in parenthesees, in bytes, written as a
- *     variable-length integer.
- *   - 'reverse_size' is the same as 'size', but with the bytes swapped
- *   - 'padding' is 1 to 8 NUL bytes, aligning the message payload to multiple of 8
- *       bytes, and also NUL terminating the message.
- *   - 'data_cksum' is a number of bytes (possibly 0) determined by cksumtype field.
- *   - 'msgtype' is a byte identifying the type of data in the message.
+ *   - Messages are marked by the signature bytes 0x1E 0x01
+ *   - 'msg_type' is a byte identifying the type of data in the message.
  *       0  - user-defined opaque bytes, user-defined flags.  utilities should display as hexdump.
  *       1  - UTF-8 text
  *       2  - UTF-8 JSON data
- *   - 'cksumtype' identifies which checksum was used for the message data
+ *   - 'msg_cksum_type' identifies which checksum was used for the message data
  *       0  - no checksum
  *       1  - CRC32 (4 byte checksum)
  *       2  - CRC64 (8 byte checksum)
  *       3  - SHA-1 (20 byte checksum)
- *   - 'msglevel' describes the priority of a message, as 0 (low) to 15 (high)
+ *   - 'msg_level' describes the priority of a message, as 0 (low) to 15 (high)
  *     A suggested mapping from msglevel to syslog constants is:
  *         >= 0xF : EMERG
  *         >= 0xE : ALERT
@@ -113,29 +106,60 @@ typedef struct ccl_log_index_entry_s {
  *         >= 0x6 : NOTICE
  *         >= 0x4 : INFO
  *         <= 0x3 : DEBUG
- *   - 'flags' are reserved for now, and should be 0 for msgtype other than 0.
- *   - 'meta_cksum' is uint32_t calculated by some simple math on the metadata bytes.
- *      (the address of the message, timestamp, size, and the 4 preceeding metadata bytes)
- *     It is used as a rough first guess of whether the message is valid, or if the
- *     user wants to navigate messages without fully reading each one.
+ *   - 'timestamp' is uint64_t fixed-precision number, and is relative to log.timestamp_epoch
+ *   - 'size' is the length of the data in parenthesees, in bytes, written as a
+ *      variable-length integer.
+ *   - 'message' is a string of text (or raw binary data) possibly *including* a checksum
+ *   - 'padding' is 1 to 8 NUL bytes, aligning the message payload to multiple of 8
+ *      bytes, and also NUL terminating the message.
+ *   - 'msg_cksum' is a number of bytes (possibly 0) determined by cksumtype field.
+ *   - 'reverse_size' is the same as 'size', but with the bytes swapped
+ *   - 'frame_cksum' is uint32_t calculated by some simple math on the metadata bytes.
+ *      (the address of the message, timestamp, size, msg_type, msg_cksum_type, msg_level)
+ *      It is used as a rough first guess of whether the message is valid, or if the
+ *      user wants to navigate messages without fully reading each one.
  */
+
+// (when read little endian)
+#define CCL_MSG_SIGNATURE 0x011E
+
+// This is not the header itself, just a handy struct for log_load_msg_header
+typedef struct ccl_msg_header_s {
+	int64_t start_addr;
+	int64_t end_addr;
+	int64_t msg_len;
+	int64_t timestamp;
+	int msg_type;
+	int msg_cksum_type;
+	int msg_level;
+	int data_ofs;
+} ccl_msg_header_t;
+
+// This is not the footer itself, just a handy struct for log_load_msg_footer
+typedef struct ccl_msg_footer_s {
+	int64_t start_addr;
+	int64_t end_addr;
+	int64_t msg_len;
+	uint32_t frame_cksum;
+} ccl_msg_footer_t;
 
 // Weak checksum... but saves us from processing the whole message,
 // and should be good enough to prevent accidentally accepting a half-written message
-#define CCL_MESSAGE_META_CHECKSUM(start_address, datalen, timestamp, info) \
+#define CCL_MESSAGE_FRAME_CHECKSUM(start_address, datalen, timestamp) \
 	( (uint32_t) ( \
 		(uint32_t)((start_address)>>3) * (uint32_t)3 \
 		+ (uint32_t)((timestamp)) * (uint32_t)5 \
 		+ (uint32_t)((timestamp)>>32) * (uint32_t)7 \
 		+ (uint32_t)((datalen)) * (uint32_t)11 \
-		+ (uint32_t)((info)) * (uint32_t)13 \
 	) )
 
 #define CCL_NSEC_TO_FRAC32(nsec) ((((uint64_t)(nsec)) * ((1ULL<<62)/1000000000)) >> 30)
 #define CCL_FRAC32_TO_NSEC(frac) ((long) (((frac) * 1000000000ULL + 0x80000000ULL) >> 32))
 
-// sizeof_size * 2 + size + 8 /*timestamp*/ + 4 /*meta*/ + 4 /*checksum*/ + padding of 1 to 8 bytes
-#define CCL_BYTES_NEEDED_FOR_MESSAGE(size, sizeof_size) ( ( ( (((sizeof_size)<<1)+(size)) >> 3) + 3) << 3)
+// 12 + sizeof_size + size + sizeof_size + 4 + NUL padding (+1, then round up to 8)
+#define CCL_MESSAGE_FRAME_SIZE(size, sizeof_size) ( \
+	( ( (((sizeof_size)<<1)+(size)) >> 3) + 3) << 3 \
+)
 
 /** ccl_log_t: circulog object representing an open log.
  *
@@ -162,7 +186,7 @@ typedef struct ccl_log_s {
 	bool writeable: 1,
 		shared_write: 1;
 	int fd;
-	volatile char *memmap;
+	volatile char *memmap, *memmap_spool;
 	size_t memmap_size;
 	int iovec_count;
 	struct iovec *iovec_buf;
@@ -176,9 +200,15 @@ typedef struct ccl_log_s {
 
 #include "circulog.h"
 
-bool log_probe_msgstart(ccl_log_t *log, int64_t start_addr, int64_t *end_addr_out, int64_t *timestamp_out);
-bool log_probe_msgend(ccl_log_t *log, int64_t end_addr, int64_t *start_addr_out, int64_t *timestamp_out);
-bool log_load_message(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg);
-bool log_load_message_nodata(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg);
+bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header);
+bool log_load_msg_footer(ccl_log_t *log, int64_t end_addr, ccl_msg_footer_t *footer);
+bool log_parse_msg_header(ccl_log_t *log, const char* bufffer, ccl_msg_header_t *header);
+bool log_parse_msg_footer(ccl_log_t *log, const char* bufffer, ccl_msg_footer_t *footer);
+bool log_load_msg_nodata(ccl_log_t *log, ccl_msg_header_t *header, ccl_msg_footer_t *footer, ccl_msg_t *msg);
+bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg, bool grow_buffer);
+bool log_find_msg_header(ccl_log_t *log, int64_t addr, bool reverse, ccl_msg_header_t *header);
+
+typedef int ccl_binary_search_callback_t(void* callback_data, ccl_msg_header_t *header);
+bool log_find_msg_header_binsearch(ccl_log_t *log, ccl_binary_search_callback_t *decision, void *decision_data, ccl_msg_header_t *header);
 
 #endif

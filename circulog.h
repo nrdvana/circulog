@@ -47,15 +47,14 @@ inline bool ccl_write_data(ccl_log_t *log, const void *data, int length, int64_t
 typedef struct ccl_msg_s {
 	int64_t address;
 	int64_t timestamp;
-	int64_t msg_len;
+	int64_t frame_len;
 	const char *data;
 	size_t data_len;
 	char *buffer;
 	size_t buffer_len;
-	int flags;
-	int data_type;
-	int data_cksum_type;
-	int level;
+	int msg_type;
+	int msg_cksum_type;
+	int msg_level;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);
@@ -83,6 +82,7 @@ extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t
 #define CCL_ESIZELIMIT     0x14
 #define CCL_EBADPARAM      0x15
 #define CCL_ENOTFOUND      0x16
+#define CCL_BUFFERSIZE     0x17
 
 // Errors about file incompatibility or corruption
 #define CCL_ELOGVERSION    0x30
