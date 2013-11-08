@@ -819,12 +819,7 @@ inline bool log_parse_msg_footer(ccl_log_t *log, const char* buffer, ccl_msg_foo
  * got_footer - whether the footer was loaded already
  * 
  */
-bool log_load_msg_nodata(
-	ccl_log_t *log,
-	ccl_msg_header_t *header,
-	ccl_msg_footer_t *footer,
-	ccl_msg_t *msg_out
-) {
+bool log_load_msg_nodata(ccl_log_t *log, ccl_msg_header_t *header, ccl_msg_footer_t *footer, ccl_msg_t *msg) {
 	ccl_msg_header_t _header;
 	ccl_msg_footer_t _footer;
 	
@@ -853,16 +848,16 @@ bool log_load_msg_nodata(
 		return SET_ERR(log, CCL_ENOTFOUND, "Wrong frame checksum");
 	
 	// found a possible message.  give caller what they asked for.
-	msg_out->address=        header->start_addr;
-	msg_out->timestamp=      header->timestamp;
-	msg_out->frame_len= (header->end_addr > header->start_addr)?
+	msg->address=        header->start_addr;
+	msg->timestamp=      header->timestamp;
+	msg->frame_len= (header->end_addr > header->start_addr)?
 		header->end_addr - header->start_addr
 		: header->end_addr - header->start_addr + log->spool_size;
-	msg_out->data=           "";
-	msg_out->data_len=       0;
-	msg_out->msg_type=       header->msg_type;
-	msg_out->msg_cksum_type= header->msg_cksum_type;
-	msg_out->msg_level=      header->msg_level;
+	msg->data=           "";
+	msg->data_len=       0;
+	msg->msg_type=       header->msg_type;
+	msg->msg_cksum_type= header->msg_cksum_type;
+	msg->msg_level=      header->msg_level;
 	return true;
 }
 
