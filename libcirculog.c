@@ -122,9 +122,25 @@ static bool log_read(ccl_log_t *log, void* record, int record_size) {
 	return true;
 }
 
-static inline bool log_readspool(ccl_log_t *log, off_t offset, void *record, int record_size) {
-	if (!log_seek(log, log->spool_start + offset))
+static inline int64_t log_wrap_addr(ccl_log_t *log, int64_t addr) {
+	addr= addr >> 3 << 3;
+	return addr < 0? addr+log->spool_size
+		: addr >= log->spool_size? addr - log->spool_size
+		: addr;
+}
+
+static inline bool log_readspool(ccl_log_t *log, int64_t start_addr, void *record, size_t record_size) {
+	if (!log_seek(log, log->spool_start + start_addr))
 		return false;
+	if (start_addr+record_size > log->spool_size) {
+		int n= (int) (log->spool_size - start_addr);
+		if (!log_read(log, record, n))
+			return false;
+		if (!log_seek(log, log->spool_start))
+			return false;
+		record= (void*) ((char*) record + n);
+		record_size -= n;
+	}
 	return log_read(log, record, record_size);
 }
 
@@ -183,7 +199,7 @@ static bool log_lock(ccl_log_t *log) {
 		ret= fcntl(log->fd, F_SETLK, &lock);
 	}
 	if (ret < 0)
-		return SET_ERR(log, CCL_ELOCK, "Failed to lock logfile for writing: $syserr");
+		return SET_ERR(log, CCL_ELOCK, "Failed to lock $logfile for writing: $syserr");
 	return true;
 }
 
@@ -199,7 +215,7 @@ static bool log_unlock(ccl_log_t *log) {
 	
 	ret= fcntl(log->fd, F_SETLK, &lock);
 	if (ret < 0)
-		return SET_ERR(log, CCL_ELOCK, "Failed to unlock logfile: $syserr");
+		return SET_ERR(log, CCL_ELOCK, "Failed to unlock $logfile: $syserr");
 	return true;
 }
 
@@ -683,14 +699,14 @@ bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 	}
 	else if (flags & CCL_SEEK_PREV) {
 		// see if another message ends at this address
-		if (!log_load_msg_footer(log, msg->address, &footer)
+		if (!log_load_msg_footer(log, log_wrap_addr(log, msg->address), &footer)
 			|| !log_load_msg_header(log, footer.start_addr, &header))
 			return SET_ERR(log, CCL_ENOTFOUND, log->last_errmsg);
 	}
 	else if (flags & CCL_SEEK_NEXT) {
 		// see if there is a message following this one.  This uses the length
 		// of the cuurent message, rather than reading it again
-		if (!log_load_msg_header(log, (msg->address + msg->frame_len)%log->spool_size, &header)
+		if (!log_load_msg_header(log, log_wrap_addr(log, msg->address + msg->frame_len), &header)
 			|| !log_load_msg_footer(log, header.end_addr, &footer))
 			return SET_ERR(log, CCL_ENOTFOUND, log->last_errmsg);
 	}
@@ -703,6 +719,90 @@ bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 		return log_load_msg(log, header.start_addr, header.end_addr, msg, flags & CCL_BUFFER_AUTO);
 }
 
+bool log_find_msg_header(ccl_log_t *log, int64_t addr, int64_t limit, ccl_msg_header_t *header) {
+	size_t buf_len, buf_pos;
+	char *buf;
+	
+	assert((addr & 7) == 0);
+	assert(addr >= 0);
+	assert(addr < log->spool_start);
+	
+	// allocate buffer if non-memmap
+	if (!log->memmap) {
+		buf_len= log->spool_size > 4096? 4096 : log->spool_size;
+		buf= malloc(buf_len);
+		if (!buf)
+			return SET_ERR(log, CCL_ESYSERR, "malloc failed");
+	}
+	
+	// positive limit means scan forward
+	while (limit > 0) {
+		if (log->memmap_spool) {
+			// handle spool-wrap
+			buf= (char*)(log->memmap_spool+addr);
+			buf_len= (size_t) (addr+limit > log->spool_size)? log->spool_size - addr : limit;
+		}
+		else {
+			if (buf_len > limit) buf_len= limit;
+			if (!log_readspool(log, addr, buf, buf_len)) {
+				free(buf);
+				return false;
+			}
+		}
+		// find next signature
+		for (buf_pos=0; buf_pos < buf_len; buf_pos+= 8) {
+			if (buf[buf_pos] == '\x1E' && buf[buf_pos+1] == '\x01')
+				if (log_load_msg_header(log, log_wrap_addr(log, addr+buf_pos-8), header)) {
+					if (!log->memmap_spool)
+						free(buf);
+					return true;
+				}
+		}
+		addr+= buf_len;
+		if (addr >= log->spool_size) addr-= log->spool_size;
+		limit-= buf_len;
+	}
+	// negative means scan backward
+	while (limit < 0) {
+		if (log->memmap_spool) {
+			// handle spool_wrap
+			if (addr+limit >= 0) { // can scan in one shot
+				addr+= limit;
+				buf_len= -limit;
+				limit= 0;
+			} else if (addr > 0) { // scan back to start of spool
+				limit+= addr;
+				buf_len= addr;
+				addr= 0;
+			} else { // scan from end of spool back -limit bytes
+				addr= log->spool_size+limit;
+				buf_len= -limit;
+				limit= 0;
+			}
+			buf= (char*)(log->memmap_spool+addr);
+		}
+		else {
+			if (buf_len > -limit) buf_len= -limit;
+			addr-= buf_len;
+			if (addr < 0) addr+= log->spool_size;
+			if (!log_readspool(log, addr, buf, buf_len)) {
+				free(buf);
+				return false;
+			}
+		}
+		// find next signature
+		for (buf_pos=buf_len-8; buf_pos >= 0; buf_pos-= 8) {
+			if (buf[buf_pos] == '\x1E' && buf[buf_pos+1] == '\x01')
+				if (log_load_msg_header(log, log_wrap_addr(log, addr+buf_pos-8), header)) {
+					if (!log->memmap_spool)
+						free(buf);
+					return true;
+				}
+		}
+	}
+	return SET_ERR(log, CCL_ENOTFOUND, "");
+}
+
 /** Load the header of the message frame into the ccl_msg_t object.
  *
  * Returns true if it succeeds and the data looks valid.
@@ -711,27 +811,22 @@ bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header) {
 	char buffer[16];
 
-	// sanity checks
-	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
-			return SET_ERR(log, CCL_EBADPARAM, "Invalid address");
+	assert((start_addr & 7) == 0);
+	assert(start_addr >= 0);
+	assert(start_addr < log->spool_start);
+
 	// read the header (for timestamp, signature and size)
 	// handle case where it could wrap the end of the spool (which is always a multiple of 8 bytes)
-	if (start_addr+8 < log->spool_size) {
-		if (log->memmap_spool)
+	if (log->memmap_spool) {
+		if (start_addr+8 < log->spool_size)
 			memcpy(buffer, (void*)(log->memmap_spool+start_addr), 16);
-		else if (!log_readspool(log, start_addr, buffer, 16))
-			return false;
-	} else {
-		if (log->memmap_spool) {
+		else {
 			memcpy(buffer, (void*)(log->memmap_spool+start_addr), 8);
 			memcpy(buffer+8, (void*)(log->memmap_spool), 8);
 		}
-		else {
-			if (!log_readspool(log, start_addr, buffer, 8)
-				|| !log_readspool(log, 0, buffer+8, 8))
-				return false;
-		}
 	}
+	else if (!log_readspool(log, start_addr, buffer, 16))
+		return false;
 	
 	header->start_addr= start_addr;
 	return log_parse_msg_header(log, buffer, header);
@@ -752,7 +847,7 @@ inline bool log_parse_msg_header(ccl_log_t *log, const char *buffer, ccl_msg_hea
 	
 	// record results
 	header->end_addr= header->start_addr + CCL_MESSAGE_FRAME_SIZE(msglen, size_size);
-	if (header->end_addr > log->spool_size)
+	if (header->end_addr >= log->spool_size)
 		header->end_addr -= log->spool_size;
 	header->msg_len=        msglen;
 	header->data_ofs=       12+size_size;
@@ -772,9 +867,9 @@ bool log_load_msg_footer(ccl_log_t *log, int64_t end_addr, ccl_msg_footer_t *foo
 	char buffer[8];
 	int64_t addr;
 	
-	// sanity checks
-	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
-		return SET_ERR(log, CCL_EBADPARAM, "Invalid end_addr");
+	assert((end_addr & 7) == 0);
+	assert(end_addr >= 0);
+	assert(end_addr < log->spool_start);
 	
 	// read the end of the message (containing size)
 	addr= end_addr - 16;
@@ -881,10 +976,12 @@ bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_
 	char *buf;
 	
 	// sanity checks
-	if (start_addr < 0 || start_addr >= log->spool_size || start_addr & 0x7)
-		return SET_ERR(log, CCL_EBADPARAM, "invalid start_addr");
-	if (end_addr <= 0 || end_addr > log->spool_size || end_addr & 0x7)
-		return SET_ERR(log, CCL_EBADPARAM, "invalid end_addr");
+	assert((start_addr & 7) == 0);
+	assert(start_addr >= 0);
+	assert(start_addr < log->spool_size);
+	assert((end_addr & 7) == 0);
+	assert(end_addr >= 0);
+	assert(end_addr < log->spool_size);
 	
 	// figure size of message + timestamp & checksum
 	frame_len= end_addr - start_addr;

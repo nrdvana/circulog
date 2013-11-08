@@ -206,7 +206,7 @@ bool log_parse_msg_header(ccl_log_t *log, const char* bufffer, ccl_msg_header_t 
 bool log_parse_msg_footer(ccl_log_t *log, const char* bufffer, ccl_msg_footer_t *footer);
 bool log_load_msg_nodata(ccl_log_t *log, ccl_msg_header_t *header, ccl_msg_footer_t *footer, ccl_msg_t *msg);
 bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_t *msg, bool grow_buffer);
-bool log_find_msg_header(ccl_log_t *log, int64_t addr, bool reverse, ccl_msg_header_t *header);
+bool log_find_msg_header(ccl_log_t *log, int64_t addr, int64_t limit, ccl_msg_header_t *header);
 
 typedef int ccl_binary_search_callback_t(void* callback_data, ccl_msg_header_t *header);
 bool log_find_msg_header_binsearch(ccl_log_t *log, ccl_binary_search_callback_t *decision, void *decision_data, ccl_msg_header_t *header);
