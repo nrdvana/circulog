@@ -1,5 +1,5 @@
-#ifndef CIRCULOG_H
-#define CIRCULOG_H
+#ifndef CCL_CIRCULOG_H
+#define CCL_CIRCULOG_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -7,7 +7,7 @@
 #include <string.h>
 #include <sys/uio.h>
 
-#ifndef CIRCULOG_INTERNAL_H
+#ifndef CCL_LIBCIRCULOG_H
 typedef struct ccl_log_s { int opaque[30]; } ccl_log_t;
 #endif
 

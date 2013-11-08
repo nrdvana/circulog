@@ -1,5 +1,5 @@
-#ifndef CIRCULOG_INTERNAL_H
-#define CIRCULOG_INTERNAL_H
+#ifndef CCL_LIBCIRCULOG_H
+#define CCL_LIBCIRCULOG_H
 
 #include <stdbool.h>
 #include <stdint.h>
