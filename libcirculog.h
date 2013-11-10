@@ -77,7 +77,7 @@ typedef struct ccl_log_index_entry_s {
  * [8] timestamp
  * [2] 0x1E 0x01  (signature)
  * [1] msg_type
- * [1] msg_cksum_type (bits 0..3), msg_level (bits 4..7)
+ * [1] msg_chk_algo (bits 0..3), msg_level (bits 4..7)
  * [1..8] size
  *        message
  *        padding
@@ -88,24 +88,9 @@ typedef struct ccl_log_index_entry_s {
  * where
  *   - Messages are marked by the signature bytes 0x1E 0x01
  *   - 'msg_type' is a byte identifying the type of data in the message.
- *       0  - user-defined opaque bytes, user-defined flags.  utilities should display as hexdump.
- *       1  - UTF-8 text
- *       2  - UTF-8 JSON data
- *   - 'msg_cksum_type' identifies which checksum was used for the message data
- *       0  - no checksum
- *       1  - CRC32 (4 byte checksum)
- *       2  - CRC64 (8 byte checksum)
- *       3  - SHA-1 (20 byte checksum)
+ *   - 'msg_chk_algo' identifies which checksum was used for the message data.
+ *       See CCL_MSG_CK_* constants.
  *   - 'msg_level' describes the priority of a message, as 0 (low) to 15 (high)
- *     A suggested mapping from msglevel to syslog constants is:
- *         >= 0xF : EMERG
- *         >= 0xE : ALERT
- *         >= 0xC : CRIT
- *         >= 0xA : ERR
- *         >= 0x8 : WARNING
- *         >= 0x6 : NOTICE
- *         >= 0x4 : INFO
- *         <= 0x3 : DEBUG
  *   - 'timestamp' is uint64_t fixed-precision number, and is relative to log.timestamp_epoch
  *   - 'size' is the length of the data in parenthesees, in bytes, written as a
  *      variable-length integer.
@@ -115,7 +100,7 @@ typedef struct ccl_log_index_entry_s {
  *   - 'msg_cksum' is a number of bytes (possibly 0) determined by cksumtype field.
  *   - 'reverse_size' is the same as 'size', but with the bytes swapped
  *   - 'frame_cksum' is uint32_t calculated by some simple math on the metadata bytes.
- *      (the address of the message, timestamp, size, msg_type, msg_cksum_type, msg_level)
+ *      (the address of the message, timestamp, size, msg_type, msg_chk_algo, msg_level)
  *      It is used as a rough first guess of whether the message is valid, or if the
  *      user wants to navigate messages without fully reading each one.
  */
@@ -130,7 +115,7 @@ typedef struct ccl_msg_header_s {
 	int64_t msg_len;
 	int64_t timestamp;
 	int msg_type;
-	int msg_cksum_type;
+	int msg_chk_algo;
 	int msg_level;
 	int data_ofs;
 } ccl_msg_header_t;
@@ -175,7 +160,7 @@ typedef struct ccl_log_s {
 	int timestamp_precision;
 	int64_t timestamp_epoch;
 	int max_message_size;
-	int checksum_algo;
+	int default_chk_algo;
 	off_t index_start,
 		index_size,
 		spool_start,
@@ -184,13 +169,13 @@ typedef struct ccl_log_s {
 	//bool dirty;
 	
 	bool writeable: 1,
-		shared_write: 1;
+	     shared_write: 1;
 	int fd;
 	volatile char *memmap, *memmap_spool;
 	size_t memmap_size;
-	int iovec_count;
+	int iovec_buf_count;
 	struct iovec *iovec_buf;
-	int64_t spool_pos;
+	int64_t spool_write_pos;
 	
 	// Storage for info about the last error
 	int last_err;
@@ -200,6 +185,7 @@ typedef struct ccl_log_s {
 
 #include "circulog.h"
 
+#define CCL_MSG_HEADER_BUFFER_BYTES 20
 bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header);
 bool log_load_msg_footer(ccl_log_t *log, int64_t end_addr, ccl_msg_footer_t *footer);
 bool log_parse_msg_header(ccl_log_t *log, const char* bufffer, ccl_msg_header_t *header);
@@ -210,5 +196,7 @@ bool log_find_msg_header(ccl_log_t *log, int64_t addr, int64_t limit, ccl_msg_he
 
 typedef int ccl_binary_search_callback_t(void* callback_data, ccl_msg_header_t *header);
 bool log_find_msg_header_binsearch(ccl_log_t *log, ccl_binary_search_callback_t *decision, void *decision_data, ccl_msg_header_t *header);
+
+bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count);
 
 #endif

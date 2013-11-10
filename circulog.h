@@ -24,41 +24,73 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 #define CCL_SHARE  2
 #define CCL_CREATE 4
 
-#define CCL_CK_METAONLY  0x4154454d
+// Users should ignore messages of type OOB
+#define CCL_MSG_TYPE_UNDEF   0
+// User-defined opaque bytes
+#define CCL_MSG_TYPE_DATA    2
+// UTF8 Text
+#define CCL_MSG_TYPE_UTF8    3
+// JSON (encoded with UTF-8)
+#define CCL_MSG_TYPE_JSON    4
+
+// Available checksum algorithms
+#define CCL_MSG_CHK_UNDEF   0
+#define CCL_MSG_CHK_NONE    1
+#define CCL_MSG_CHK_CRC32   2
+#define CCL_MSG_CHK_CRC64   3
+#define CCL_MSG_CHK_SHA1    4
+
+// Message levels are from -3 (lowest) to 12 (highest)
+#define CCL_MSG_LEVEL_DEBUG3  -3
+#define CCL_MSG_LEVEL_DEBUG2  -2
+#define CCL_MSG_LEVEL_DEBUG1  -1
+#define CCL_MSG_LEVEL_TRACE   CCL_MSG_LEVEL_DEBUG3
+#define CCL_MSG_LEVEL_DEBUG   CCL_MSG_LEVEL_DEBUG1
+#define CCL_MSG_LEVEL_INFO    0
+#define CCL_MSG_LEVEL_NOTICE  1
+#define CCL_MSG_LEVEL_WARN    2
+#define CCL_MSG_LEVEL_WARNING CCL_MSG_LEVEL_WARN
+#define CCL_MSG_LEVEL_ERROR   4
+#define CCL_MSG_LEVEL_ERR     CCL_MSG_LEVEL_ERROR
+#define CCL_MSG_LEVEL_FATAL   6
+#define CCL_MSG_LEVEL_CRIT    8
+#define CCL_MSG_LEVEL_ALERT   10
+#define CCL_MSG_LEVEL_EMERG   12
 
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
-extern bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp);
-
-inline bool ccl_write_str(ccl_log_t *log, const char *str, int64_t timestamp) {
-	struct iovec tmp;
-	tmp.iov_base= (void*) str;
-	tmp.iov_len= strlen(str);
-	return ccl_write_vec(log, &tmp, 1, timestamp);
-}
-
-inline bool ccl_write_data(ccl_log_t *log, const void *data, int length, int64_t timestamp) {
-	struct iovec tmp;
-	tmp.iov_base= (void*) data;
-	tmp.iov_len= length;
-	return ccl_write_vec(log, &tmp, 1, timestamp);
-}
-
 typedef struct ccl_msg_s {
 	int64_t address;
-	int64_t timestamp;
+	uint64_t timestamp;
 	int64_t frame_len;
 	const char *data;
 	size_t data_len;
 	char *buffer;
 	size_t buffer_len;
-	int msg_type;
-	int msg_cksum_type;
-	int msg_level;
+	int type;
+	int level;
+	int chk_algo;
 } ccl_msg_t;
 
 extern bool ccl_msg_init(ccl_msg_t *msg);
 extern bool ccl_msg_destroy(ccl_msg_t *msg);
+
+extern bool ccl_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count);
+inline bool ccl_write_msg_(ccl_log_t *log, ccl_msg_t msg) {
+	return ccl_write_msg(log, &msg, NULL, 0);
+}
+
+#define CCL_WRITE_DATA(log, data, length, ...) ccl_write_msg_(log, (ccl_msg_t){ \
+	.type= CCL_MSG_TYPE_DATA, .timestamp= 0, .chk_algo= 0, .level= 0, \
+	.data= (data), .data_len= (length), ##__VA_ARGS__ })
+
+#define CCL_WRITE_UTF8(log, str, ...) ccl_write_msg_(log, (ccl_msg_t){ \
+	.type= CCL_MSG_TYPE_UTF8, .timetsamp= 0, .chk_algo= 0, .level= 0, \
+	.data= (str), .data_len= strlen(str), ##__VA_ARGS__ })
+
+#define CCL_WRITE_JSON(log, str, ...) ccl_write_msg_(log, (ccl_msg_t){ \
+	.type= CCL_MSG_TYPE_JSON, .timetsamp= 0, .chk_algo= 0, .level= 0, \
+	.data= (str), .data_len= strlen(str), ##__VA_ARGS__ })
 
 #define CCL_SEEK_ADDR     0x0000
 #define CCL_SEEK_TIME     0x0001
@@ -69,7 +101,7 @@ extern bool ccl_msg_destroy(ccl_msg_t *msg);
 #define CCL_SEEK_MASK     0x000F
 #define CCL_BUFFER_AUTO   0x0100
 #define CCL_NODATA        0x0200
-extern bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags);
+extern bool ccl_read_msg(ccl_log_t *log, ccl_msg_t *msg, int flags);
 
 extern uint64_t ccl_encode_timestamp(ccl_log_t *log, struct timespec *t);
 extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t_out);
@@ -82,7 +114,8 @@ extern void ccl_decode_timestamp(ccl_log_t *log, uint64_t ts, struct timespec *t
 #define CCL_ESIZELIMIT     0x14
 #define CCL_EBADPARAM      0x15
 #define CCL_ENOTFOUND      0x16
-#define CCL_BUFFERSIZE     0x17
+#define CCL_EBUFFERSIZE    0x17
+#define CCL_EUNSUPPORTED   0x18
 
 // Errors about file incompatibility or corruption
 #define CCL_ELOGVERSION    0x30

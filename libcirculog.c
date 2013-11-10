@@ -25,11 +25,6 @@ bool ccl_init(ccl_log_t *log, int struct_size) {
 	if (struct_size < sizeof(*log))
 		return false;
 	memset(log, 0, struct_size);
-	log->timestamp_precision= CCL_DEFAULT_TIMESTAMP_PRECISION;
-	log->max_message_size=    CCL_DEFAULT_MAX_MESSAGE_SIZE;
-	log->index_size=          1;
-	log->spool_size=          CCL_DEFAULT_SPOOL_SIZE;
-	log->checksum_algo=       CCL_CK_METAONLY;
 	log->fd= -1;
 	return true;
 }
@@ -46,6 +41,11 @@ bool ccl_destroy(ccl_log_t *log) {
 		err= err || close(log->fd);
 		log->fd= -1;
 	}
+	if (log->iovec_buf) {
+		free(log->iovec_buf);
+		log->iovec_buf= NULL;
+		log->iovec_buf_count= 0;
+	}
 	return !err;
 }
 
@@ -55,7 +55,7 @@ bool log_resize_iovec(ccl_log_t *log, int new_count) {
 	if (!newbuf)
 		return SET_ERR(log, CCL_ESYSERR, "malloc: $syserr");
 	log->iovec_buf= newbuf;
-	log->iovec_count= new_count;
+	log->iovec_buf_count= new_count;
 	return true;
 }
 
@@ -609,7 +609,7 @@ inline int decode_size(uint32_t encoded, uint32_t *value_out) {
 	}
 }
 
-/** ccl_read - try to read a message (usually combined with a seek flag)
+/** ccl_read_msg - try to read a message (usually combined with a seek flag)
  *
  * Reading a CircuLog is a best-effort sort of algorithm, which runs
  * unsynchronized with the writing process, and may or may not succeed.
@@ -623,29 +623,18 @@ inline int decode_size(uint32_t encoded, uint32_t *value_out) {
  * If no seek flag is specified, this method tries to read a message at
  * msg->address, and fails if that is not the start of a valid message.
  * 
- * Upon success, ccl_read_message will return true, and set:
- *   msg->address to the file address of the found message,
- *   msg->timestamp to the raw 64-bit timestamp of the message,
- *   msg->msg_len to the length, in bytes (not counting NUL padding) of the message data
- *   msg->data to a NUL-terminated string (of raw binary data)
- *   msg->data_len to the number of bytes available in msg->data
- *   msg->data_type to the byte-code indicating the message's type
- *   msg->data_cksum_type to the code of the checksum algorithm for the message
- *   msg->flags to the 16-bit flags of the message
- *   msg->level to the priority (low=0 .. high=15) of the message
- *
- * In addition, if the flag CCL_BUFFER_AUTO is requested, ccl_read_message
- *   will automatically malloc or realloc the msg->buffer field large enough
- *   to hold the current message and its protocol bytes, and set
- *   msg->buffer_len to match.
+ * Upon success, ccl_read_msg will return true, and set all fields of msg
+ * other than buffer and buffer_len, unless CCL_BUFFER_AUTO flag is given
+ * in which case the buffer will be resized as needed.
  *
  * The msg->data pointer will be set to "" if the flag CCL_NODATA is requested,
  * and msg->data_len to 0.
  *
  * Else, if msg->buffer is non-null (possibly as the result of CCL_BUFFER_AUTO)
  * msg->data will be a pointer into msg->buffer.  msg->data_len might be less
- * than msg->msg_len if the buffer was not large enough.  Note that the buffer
- * needs to be *larger* than msg->msg_len to accomodate protocol bytes.
+ * than the full message length if the buffer wasn't large enough, but the return
+ * code will be false to make you aware of this.  Try again with a buffer at least
+ * msg->frame_len or larger.
  *
  * Note that the writer is allowed to write raw binary data (including NUL
  * charachers) into a message.  Use data_len instead of strlen(data) if you
@@ -671,7 +660,7 @@ inline int decode_size(uint32_t encoded, uint32_t *value_out) {
  * message at msg->address.
  *
  * CCL_SEEK_NEXT tries to read a log message immediately following the message
- * at msg->address based on msg->msg_len.
+ * at msg->address based on msg->frame_len.
  *
  * CCL_SEEK_RELATIVE looks at msg->offset to perform some number of CCL_SEEK_PREV
  * (negative) or CCL_SEEK_NEXT (positive).  In other words, setting msg->offset
@@ -679,23 +668,23 @@ inline int decode_size(uint32_t encoded, uint32_t *value_out) {
  * CCL_SEEK_PREV. -5 means perform CCL_SEEK_PREV 5 times.
  *
  */
-bool ccl_read_message(ccl_log_t *log, ccl_msg_t *msg, int flags) {
+bool ccl_read_msg(ccl_log_t *log, ccl_msg_t *msg, int flags) {
 	ccl_msg_header_t header;
 	ccl_msg_footer_t footer;
 	
 	if (flags & CCL_SEEK_ADDR) {
 		// Scan 1024 bytes at a time, in each direction, and pick the nearest message.
-		return SET_ERR(log, CCL_EBADPARAM, "unimplemented"); // TODO: implement.
+		return SET_ERR(log, CCL_EUNSUPPORTED, "unimplemented"); // TODO: implement.
 	}
 	else if (flags & CCL_SEEK_TIME) {
 		// seek toward the given timestamp
-		return SET_ERR(log, CCL_EBADPARAM, "unimplemented"); // TODO: implement
+		return SET_ERR(log, CCL_EUNSUPPORTED, "unimplemented"); // TODO: implement
 	}
 	else if (flags & CCL_SEEK_OLDEST) {
-		return SET_ERR(log, CCL_EBADPARAM, "unimplemented"); // TODO: implement
+		return SET_ERR(log, CCL_EUNSUPPORTED, "unimplemented"); // TODO: implement
 	}
 	else if (flags & CCL_SEEK_NEWEST) {
-		return SET_ERR(log, CCL_EBADPARAM, "unimplemented"); // TODO: implement
+		return SET_ERR(log, CCL_EUNSUPPORTED, "unimplemented"); // TODO: implement
 	}
 	else if (flags & CCL_SEEK_PREV) {
 		// see if another message ends at this address
@@ -849,12 +838,12 @@ inline bool log_parse_msg_header(ccl_log_t *log, const char *buffer, ccl_msg_hea
 	header->end_addr= header->start_addr + CCL_MESSAGE_FRAME_SIZE(msglen, size_size);
 	if (header->end_addr >= log->spool_size)
 		header->end_addr -= log->spool_size;
-	header->msg_len=        msglen;
-	header->data_ofs=       12+size_size;
-	header->timestamp=      le64toh(* (int64_t *) buffer);
-	header->msg_type=       (uint8_t) buffer[10];
-	header->msg_cksum_type= 0xF & buffer[11];
-	header->msg_level=      0xF & (buffer[11] >> 4);
+	header->msg_len=       msglen;
+	header->data_ofs=      12 + size_size;
+	header->timestamp=     le64toh(* (int64_t *) buffer);
+	header->msg_type=      (uint8_t) buffer[10];
+	header->msg_chk_algo=  (0xF & buffer[11]) + 1;
+	header->msg_level=     (0xF & (buffer[11] >> 4)) - 3;
 	return true;
 }
 
@@ -943,16 +932,16 @@ bool log_load_msg_nodata(ccl_log_t *log, ccl_msg_header_t *header, ccl_msg_foote
 		return SET_ERR(log, CCL_ENOTFOUND, "Wrong frame checksum");
 	
 	// found a possible message.  give caller what they asked for.
-	msg->address=        header->start_addr;
-	msg->timestamp=      header->timestamp;
+	msg->address=   header->start_addr;
+	msg->timestamp= header->timestamp;
 	msg->frame_len= (header->end_addr > header->start_addr)?
 		header->end_addr - header->start_addr
 		: header->end_addr - header->start_addr + log->spool_size;
-	msg->data=           "";
-	msg->data_len=       0;
-	msg->msg_type=       header->msg_type;
-	msg->msg_cksum_type= header->msg_cksum_type;
-	msg->msg_level=      header->msg_level;
+	msg->data=      "";
+	msg->data_len=  0;
+	msg->type=      header->msg_type;
+	msg->chk_algo=  header->msg_chk_algo;
+	msg->level=     header->msg_level;
 	return true;
 }
 
@@ -992,7 +981,7 @@ bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_
 		return SET_ERR(log, CCL_EBADPARAM, "invalid message length");
 	// Must fit in size_t for this implementation
 	if (sizeof(size_t) < 8 && frame_len > (int64_t)(size_t)-1)
-		return SET_ERR(log, CCL_ESIZELIMIT, "message size exceeds size_t");
+		return SET_ERR(log, CCL_EUNSUPPORTED, "message size exceeds size_t");
 
 	n= (size_t) frame_len;
 	// Grow the buffer if needed and allowed
@@ -1053,10 +1042,10 @@ bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_
 			return false;
 		
 		// verify message checksum
-		switch (header.msg_cksum_type) {
+		switch (header.msg_chk_algo) {
 		  case 0:  break; // 0 is "no checksum"
 		// TODO: run CRC32 or CRC64 or SHA-1 checks.
-		  default: return SET_ERR(log, CCL_ELOGVERSION, "Message uses unknown checksum algorithm");
+		  default: return SET_ERR(log, CCL_EUNSUPPORTED, "Message uses unknown checksum algorithm");
 		}
 		
 		msg->data= msg->buffer + header.data_ofs;
@@ -1074,150 +1063,203 @@ bool log_load_msg(ccl_log_t *log, int64_t start_addr, int64_t end_addr, ccl_msg_
 			n2= msg->buffer_len - header.data_ofs;
 			msg->data_len= (header.msg_len > n2)? (size_t) header.msg_len : n2;
 		}
-		return SET_ERR(log, CCL_BUFFERSIZE, "Message buffer smaller than frame_len");
+		return SET_ERR(log, CCL_EBUFFERSIZE, "Message buffer smaller than frame_len");
 	}
 	return true;
 }
 
-bool ccl_write_vec(ccl_log_t *log, const struct iovec *caller_iov, int iov_count, int64_t timestamp) {
-	uint64_t prefix[1], suffix[3];
-	int i, prefix_size, suffix_size, first_part, ofs;
-	struct iovec *iov;
-	ccl_log_index_entry_t index_entry;
-	int64_t msglen, msglen2, record_len, spool_pos, prev_index_entry, last_index_entry;
+bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count) {
+	// Header is 12 bytes + size_size, which is 4 bytes max in the current implementation.
+	// Footer is big enough for padding (max 8), checksum (max 20), size (max 4), frame_cksum (4)
+	char buffer[16 + 8+24+4+4]; // header, footer
+	char *header_buf= buffer;
+	char *footer_buf= buffer+sizeof(buffer); // grows backward
+	char *chk_buf, *buf_tmp;
+	size_t header_buf_len, footer_buf_len;
 	
-	// access-mode check
-	if (!log->writeable)
-		return SET_ERR(log, CCL_EREADONLY, "Can't write to read-only log");
+	size_t msg_len, msg_len2, cksum_len, padding_len, n, tmp;
+	int64_t addr= msg->address, frame_len;
+	uint32_t encoded_size;
+	int i, size_size;
+	bool success;
 	
-	// TODO: add support for shared write-access
-	if (log->shared_write)
-		if (!log_lock(log))
-			return false;
+	// sanity checks
+	assert(iov_count >= 2);
+	assert(iov[0].iov_len == 0);
+	assert(iov[iov_count-1].iov_len == 0);
+	assert((addr & 7) == 0);
+	assert(addr >= 0);
+	assert(addr < log->spool_size);
+	assert((msg->type >> 8) == 0);
+	assert(((msg->chk_algo-1) >> 4) == 0);
+	assert(((msg->level+3) >> 4) == 0);
 	
-	// Fill in the timestamp with "now()" if not specified by the user
-	if (timestamp == 0) {
-		timestamp= ccl_timestamp_from_timespec(log, NULL);
-		if (timestamp == 0)
-			return SET_ERR(log, CCL_ESYSERR, "Can't generate timestamp: $syserr");
+	switch (msg->chk_algo) {
+	case CCL_MSG_CHK_NONE: cksum_len= 0; break;
+	case CCL_MSG_CHK_CRC32:
+	case CCL_MSG_CHK_CRC64:
+	case CCL_MSG_CHK_SHA1:
+		return SET_ERR(log, CCL_EUNSUPPORTED, "Unimplemented checksum algorithm");
+	default:
+		return SET_ERR(log, CCL_EBADPARAM, "Undefined checksum algorithm");
 	}
 	
 	// sum up the message size
-	// start at 64 so we can check the whole record size for int overflow
-	//  on 32-bit (or less likely, overflow on 64-bit)
-	msglen= 64;
-	for (i= 0; i < iov_count; i++) {
-		msglen2= msglen + caller_iov[i].iov_len;
-		if (msglen2 < msglen)
-			return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds implementation limits");
-		msglen= msglen2;
+	// start at 32 so we can check the whole record size for int overflow
+	//  on 32-bit (or less likely, overflow on 64-bit, if bad values in iov_len)
+	msg_len= 32+cksum_len;
+	for (i= iov_count-2; i; i--) {
+		msg_len2= msg_len + iov[i].iov_len;
+		if (msg_len2 < msg_len)
+			return SET_ERR(log, CCL_EUNSUPPORTED, "Message size exceeds implementation limits");
+		msg_len= msg_len2;
 	}
-	msglen -= 64; // subtract it back off
-	// check vs. max message size
-	if (msglen > log->max_message_size)
+	msg_len -= 32; // subtract it back off
+	
+	// encode the message size, and determine length of encoding
+	if ((msg_len >> 32) || !(size_size= encode_size((uint32_t) msg_len, &encoded_size)))
+		return SET_ERR(log, CCL_EUNSUPPORTED, "Message size exceeds implementation limits");
+
+	// check vs. max message size of this logfile
+	if (msg_len > log->max_message_size)
 		return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds max_message_size of log");
+
+	frame_len= CCL_MESSAGE_FRAME_SIZE(msg_len, size_size);
+	msg->frame_len= frame_len;
+	if (frame_len > log->spool_size)
+		return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds log spool size");
 	
-	// encode the variable-length size, and determine its size
-	prefix_size= encode_size(msglen, prefix);
-	if (!prefix_size)
-		return SET_ERR(log, CCL_EMSGSIZE, "Message size exceeds implementation limits");
-	suffix_size= 8 + 8 + 8 - ((prefix_size + msglen) & 0x7);
+	padding_len= frame_len - 12 - size_size - msg_len - size_size - 4;
+	assert(padding_len > 0);
+	assert(padding_len <= 8);
+
+	// format header
+	* (int64_t*) header_buf = msg->timestamp;
+	header_buf[8]= '\x1E';
+	header_buf[9]= '\x01';
+	header_buf[10]= msg->type;
+	header_buf[11]= ((msg->level+3) << 4) | ((msg->chk_algo-1) & 0xF);
+	* (int32_t*) (header_buf+12) = htole32(encoded_size);
+	header_buf_len= 12 + size_size;
 	
-	// prefix size gets encoded little-endian, and suffix size gets encoded big-endian
-	suffix[0]= htobe64(prefix[0]);
-	prefix[0]= htole64(prefix[0]);
-	// after reverse size is timestamp, and checksum, encoded as little-endian
-	suffix[1]= htole64(timestamp);
-	suffix[2]= htole64(CCL_MESSAGE_META_CHECKSUM(msglen, timestamp, log->spool_pos));
-	
-	// Also calculate which index entries are affected
-	// An index entry is updated if this is the first message to be written into it.
-	record_len= prefix_size + msglen + suffix_size;
-	prev_index_entry= (log->spool_pos-1) >> CCL_INDEX_GRANULARITY_BITS;
-	// (We handle wrap-around later)
-	last_index_entry= (log->spool_pos+record_len) >> CCL_INDEX_GRANULARITY_BITS;
-	
-	// If we're in mmap mode, do things the easy way
-	if (log->memmap) {
-		abort(); // TODO: implement
+	// format footer
+	footer_buf_len= 4 + size_size + cksum_len + padding_len;
+	* (uint32_t*) (footer_buf - 4) = htole32( CCL_MESSAGE_FRAME_CHECKSUM(addr, msg_len, msg->timestamp) );
+	* (uint32_t*) (footer_buf - 8) = htobe32(encoded_size);
+	footer_buf -= footer_buf_len;
+	// fill padding with NUL bytes
+	for (i= 0; i < padding_len; i++)
+		footer_buf[i]= '\0';
+	// set up buffer pos for writing checksum
+	chk_buf= footer_buf + padding_len;
+	// checksum of all message data bytes, not including pading
+	switch (msg->chk_algo) {
+	case CCL_MSG_CHK_NONE: break;
+	default:
+		return SET_ERR(log, CCL_EUNSUPPORTED, "BUG: unhandled cksum_algo");
 	}
-	// else call seek and writev
+
+	// set up iovecs for header & footer
+	iov[0].iov_base= header_buf;
+	iov[0].iov_len=  header_buf_len;
+	iov[iov_count-1].iov_base= footer_buf;
+	iov[iov_count-1].iov_len=  footer_buf_len;
+	
+	// write it, either via mmap or writev
+	if (log->memmap_spool) {
+		for (i= 0; i<iov_count; i++) {
+			if (addr + iov[i].iov_len <= log->spool_size) {
+				memcpy((void*) (log->memmap_spool+addr), iov[i].iov_base, iov[i].iov_len);
+				addr+= iov[i].iov_len;
+			}
+			else {
+				n= (size_t) (log->spool_size - addr);
+				memcpy((void*) (log->memmap_spool+addr), iov[i].iov_base, n);
+				memcpy((void*) log->memmap_spool, ((char*)iov[i].iov_base) + n, iov[i].iov_len - n);
+				addr= iov[i].iov_len - n;
+			}
+		}
+	}
 	else {
-		// we build a new io vector containing the prefix, user's vectors, and suffix.
-		// (we re-use an iovec which we keep in log->iovec_buf)
-		if (log->iovec_count < iov_count+2)
-			if (!log_resize_iovec(log, iov_count+2))
-				return false;
-		iov= log->iovec_buf;
-		
-		// now build the new iov
-		iov[0].iov_base= (void*)  prefix;
-		iov[0].iov_len=  (size_t) prefix_size;
-		memcpy(iov+1, caller_iov, sizeof(*iov) * iov_count);
-		iov_count++;
-		iov[iov_count].iov_base= (void*)( ((char*)suffix) + sizeof(suffix) - suffix_size);
-		iov[iov_count].iov_len=  suffix_size;
-		iov_count++;
-			
-		// now write it
-		spool_pos= log->spool_pos;
-		// TODO: find way to prevent this call by knowing if we're at spool_pos already
-		if (!log_seek(log, log->spool_start + spool_pos))
+		if (!log_seek(log, log->spool_start + addr))
 			return false;
-		
-		// Will this message wrap?  if not, just call writev.  If it will,
-		// just write the individual buffers one at a time and split the one
-		// that crosses the boundary.
-		if (spool_pos + record_len <= log->spool_size) {
+		// If we don't wrap the spool, we can use a single writev().
+		if (addr + frame_len <= log->spool_size) {
 			if (!log_writev(log, iov, iov_count))
 				return false;
 		}
+		// Else, we have to split the iovec[] into 2 segments.
 		else {
+			// figure out which iovec we need to split
+			n= log->spool_size - addr;
 			for (i= 0; i < iov_count; i++) {
-				if (spool_pos + iov[i].iov_len <= log->spool_size) {
-					if (!log_write(log, iov[i].iov_base, iov[i].iov_len))
-						return false;
-					spool_pos+= iov[i].iov_len;
-				}
-				else {
-					first_part= log->spool_size - spool_pos;
-					if (!log_write(log, iov[i].iov_base, first_part))
-						return false;
-					if (!log_seek(log, log->spool_start))
-						return false;
-					if (!log_write(log, ((char*)iov[i].iov_base)+first_part, iov[i].iov_len-first_part))
-						return false;
-					spool_pos= iov[i].iov_len-first_part;
-				}
+				if (n < iov[i].iov_len)
+					// split this one.
+					break;
+				n -= iov[i].iov_len;
 			}
-		}
-		// write index entries if necessary
-		if (log->index_size && prev_index_entry < last_index_entry) {
-			index_entry.timestamp=  htole64(timestamp);
-			index_entry.msg_offset= htole64(log->spool_pos);
-			ofs= (prev_index_entry+1) * CCL_INDEX_ENTRY_SIZE;
-			// trick to re-use code below
-			if (ofs < log->index_size)
-				ofs+= log->index_size;
-			// write each entry
-			for (i= last_index_entry-prev_index_entry; i < 0; i--) {
-				if (ofs >= log->index_size) {
-					ofs-= log->index_size;
-					if (!log_seek(log, log->index_start + ofs))
-						return false;
-				}
-				if (!log_write(log, &index_entry, sizeof(index_entry)))
-					return false;
-			}
+
+			// first half
+			tmp= iov[i].iov_len;
+			iov[i].iov_len= n;
+			success= log_writev(log, iov, i+1);
+			iov[i].iov_len= tmp;
+			if (!success) return false;
+
+			// second half
+			if (!log_seek(log, log->spool_start))
+				return false;
+			buf_tmp= (char*) iov[i].iov_base;
+			iov[i].iov_base= buf_tmp+n;
+			iov[i].iov_len -= n;
+			success= log_writev(log, iov+i, iov_count-i);
+			iov[i].iov_base= buf_tmp;
+			iov[i].iov_len= tmp;
+			if (!success) return false;
 		}
 	}
-	
-	// Finally, update spool_pos
-	log->spool_pos+= record_len;
-	if (log->spool_pos - log->spool_size > 0)
-		log->spool_pos-= log->spool_size;
 	return true;
 }
+
+bool ccl_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count) {
+	// access-mode check
+	if (!log->writeable)
+		return SET_ERR(log, CCL_EREADONLY, "Log is read-only");
+	// Type is required
+	if (!msg->type)
+		return SET_ERR(log, CCL_EBADPARAM, "msg->type must be non-zero");
+	
+	// Cksum algorithm defaults to setting in log.
+	if (!msg->chk_algo)
+		msg->chk_algo= log->default_chk_algo;
+	
+	// Fill in the timestamp with "now()" if not specified by the user
+	if (msg->timestamp == 0) {
+		msg->timestamp= ccl_timestamp_from_timespec(log, NULL);
+		if (msg->timestamp == 0)
+			return SET_ERR(log, CCL_ESYSERR, "Can't generate timestamp: $syserr");
+	}
+	
+	// we build a new io vector with room for the prefix, user's vectors, and suffix.
+	// (we re-use an iovec which we keep in log->iovec_buf)
+	if (log->iovec_buf_count < iov_count+2)
+		if (!log_resize_iovec(log, iov_count+2))
+			return false;
+	memcpy(log->iovec_buf+1, iov, sizeof(*iov) * iov_count);
+	log->iovec_buf[0].iov_len= 0;
+	log->iovec_buf[iov_count+1].iov_len= 0;
+
+	// Determine next spool address to write.  If log is shared, need to lock, then
+	// seek newest, then write, then unock.  If we are sole writer, then just continue
+	// where we left off.
+	// TODO: add support for shared write-access
+	if (log->shared_write)
+		return SET_ERR(log, CCL_EUNSUPPORTED, "Shared write is not implemented");
+	msg->address= ;
+	
+	return log_write_msg(log, msg, log->iovec_buf, iov_count+2);
+}
+
 
 /*
 bool ccl_read_message(ccl_log_t *log, ccl_message_info_t *msg_out) {
