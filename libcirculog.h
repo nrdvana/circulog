@@ -13,12 +13,9 @@
  *  - magic == CCL_HEADER_MAGIC
  *  - version >= oldest_compat_version
  *  - header_size >= CCL_MIN_HEADER_SIZE
- *  - index_start >= header_size
- *  - index_size is a multiple of sizeof(ccl_log_index_entry_t)
- *  - index_size / sizeof(ccl_log_index_entry_t) == ceil(spool_size / INDEX_GRANULARITY)
- *  - spool_start >= index_start+index_size
+ *  - timestamp_precision < 64
+ *  - spool_start >= header_size
  *  - spool_size is a multiple of 8 bytes
- *  - file size >= spool_start+spool_size
  *
  * The spool must start on a page boundary and be a multiple of the
  * page size in order for the mmap optimizations to be used.
@@ -26,50 +23,23 @@
  * inelegible for the optimization.
  */
 typedef struct ccl_log_header_s {
-	uint64_t
-		magic;
-	uint32_t
-		version,
-		oldest_compat_version,
-		header_size,
-		timestamp_precision;
-	int64_t
-		timestamp_epoch;
-	uint64_t
-		index_start,
-		index_size,
-		spool_start,
-		spool_size;
-	uint32_t
-		max_message_size,
-		reserved_1;
+	uint64_t magic;
+	uint16_t version;
+	uint16_t oldest_compat_version;
+	uint32_t config_len;
+	char     config_sha1[20];
 } ccl_log_header_t;
-
-typedef struct ccl_log_header_s ccl_log_header_v0;
 
 #define CCL_HEADER_MAGIC 0x676f4c7563726943LL
 #define CCL_MIN_HEADER_SIZE (sizeof(ccl_log_header_v0))
 #define CCL_CURRENT_VERSION 0x00000000
 #define CCL_DEFAULT_MAX_MESSAGE_SIZE 4096
 #define CCL_DEFAULT_SPOOL_SIZE (10*1024*1024)
-#define CCL_DEFAULT_TIMESTAMP_PRECISION 32
+#define CCL_DEFAULT_TIMESTAMP_PRECISION 20
+#define CCL_DEFAULT_CHK_ALGO CCL_MSG_CHK_NONE
 #define CCL_INDEX_GRANULARITY_BITS 16
 #define CCL_INDEX_GRANULARITY (1<<CCL_INDEX_GRANULARITY_BITS)
 #define CCL_INDEX_ENTRY_SIZE (sizeof(ccl_log_index_entry_t))
-
-/** ccl_log_index_entry_t : format of each element in the index
- *
- * The index is simply a circular log of index entries, where each entry
- * is a timestamped pointer to a message in the main log data.
- * The index is just a suggestion of where to find valid log entries.
- * Valid log entries can always be found at the first byte of the file,
- * though it might be inefficient to scan the whole log file for the
- * desired timestamp.  The index speeds this up.
- */
-typedef struct ccl_log_index_entry_s {
-	int64_t timestamp;  // relative to timestamp_epoch
-	int64_t msg_offset; // offset from start of message area
-} ccl_log_index_entry_t;
 
 /* Format of a log message
  * (can't be represented as a plain C struct)
@@ -150,29 +120,31 @@ typedef struct ccl_msg_footer_s {
  *
  * This struct is permitted to exist in varying states of validity.
  * Always initialize with ccl_init, and call ccl_destroy when done, even if
- * ccl_open failed ** unless ** you use ccl_new and ccl_delete, which call
+ * ccl_open failed **unless** you use ccl_new and ccl_delete, which call
  * init and destroy for you.
  */
 typedef struct ccl_log_s {
 	// Log-specific parameters
-	int header_size;
+	ccl_log_header_t header;
+	char* config;
+	size_t config_len, config_alloc;
+	
+	// Parsed versions of key settings
+	char *name;
 	int version;
 	int timestamp_precision;
-	int64_t timestamp_epoch;
+	uint64_t timestamp_epoch;
 	int max_message_size;
 	int default_chk_algo;
-	off_t index_start,
-		index_size,
-		spool_start,
-		spool_size;
-	//bool wrong_endian;
-	//bool dirty;
+	off_t spool_start, spool_size;
 	
 	bool writeable: 1,
 	     shared_write: 1;
 	int fd;
 	volatile char *memmap, *memmap_spool;
 	size_t memmap_size;
+
+	// a temporary allocated struct we re-use between calls to write
 	int iovec_buf_count;
 	struct iovec *iovec_buf;
 	int64_t spool_write_pos;
@@ -184,6 +156,9 @@ typedef struct ccl_log_s {
 } ccl_log_t;
 
 #include "circulog.h"
+
+bool log_set_config(ccl_log_t *log, const char* name, int name_len, const char* value, int value_len);
+char* log_get_config(ccl_log_t *log, const char* name, int name_len);
 
 #define CCL_MSG_HEADER_BUFFER_BYTES 20
 bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header);

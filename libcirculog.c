@@ -26,13 +26,19 @@ bool ccl_init(ccl_log_t *log, int struct_size) {
 		return false;
 	memset(log, 0, struct_size);
 	log->fd= -1;
+	log->version=             CCL_CURRENT_VERSION;
+	log->timestamp_precision= CCL_DEFAULT_TIMESTAMP_PRECISION;
+	log->timestamp_epoch=     0;
+	log->max_message_size=    CCL_DEFAULT_MAX_MESSAGE_SIZE;
+	log->default_chk_algo=    CCL_DEFAULT_CHK_ALGO;
+	log->spool_size=          CCL_DEFAULT_SPOOL_SIZE;
 	return true;
 }
 
 bool ccl_destroy(ccl_log_t *log) {
 	bool err= false;
 	if (log->memmap) {
-		err= err || munmap((void*)log->memmap, (size_t) log->memmap_size);
+		err= err || munmap((void*) log->memmap, (size_t) log->memmap_size);
 		log->memmap= NULL;
 		log->memmap_spool= NULL;
 		log->memmap_size= 0;
@@ -46,9 +52,311 @@ bool ccl_destroy(ccl_log_t *log) {
 		log->iovec_buf= NULL;
 		log->iovec_buf_count= 0;
 	}
+	if (log->name) {
+		free(log->name);
+		log->name= NULL;
+	}
+	if (log->config) {
+		free(log->config);
+		log->config= NULL;
+		log->config_len= log->config_alloc= 0;
+	}
 	return !err;
 }
 
+#define ROUND_MULTIPLE(x, multiple_of) ( (((x)-1) | ((multiple_of)-1)) + 1 )
+
+bool log_resize_configbuf(ccl_log_t *log, int new_config_len) {
+	int pagesize;
+	size_t new_config_alloc;
+	char *new_config;
+	
+	// We always allocate in multiples of pagesize (or 256)
+	pagesize= sysconf(_SC_PAGESIZE);
+	if (pagesize < 256) pagesize= 256;
+	
+	new_config_alloc= ROUND_MULTIPLE(new_config_len, pagesize);
+	if (new_config_alloc > log->config_alloc) {
+		new_config= (char*) realloc(log->config, new_config_alloc);
+		if (!new_config)
+			return SET_ERR(log, CCL_ESYSERR, "realloc failed");
+		log->config= new_config;
+		log->config_alloc= new_config_alloc;
+	}
+	return true;
+}
+
+/** Get a config value from the header.
+ *
+ * This performs a linear scan of the log->config buffer (copied form the log header)
+ * looking for name.  If found, returns a pointer to the "name=value\0" string.
+ * Else returns NULL.  Does not update log->error* fields.
+ *
+ * TODO: do something smarter than a linear scan.
+ */
+char* log_get_config(ccl_log_t *log, const char* name, int name_len) {
+	char *p, *endp;
+
+	if (!log->config)
+		return NULL;
+	for (p= log->config, endp= p + log->config_len; p; p= (char*) memchr(p, 0, endp - p)) {
+		if (endp - p > name_len + 1
+			&& memcmp(name, p, name_len) == 0
+			&& p[name_len] == '=')
+			return p;
+	}
+	return NULL;
+}
+
+inline bool log_get_config_int(ccl_log_t *log, const char *name, int name_len, int64_t *val) {
+	const char *setting;
+	char *endptr;
+	
+	if (!(setting= log_get_config(log, name, name_len)))
+		return false;
+	*val= strtoll(setting + name_len + 1, &endptr, 0);
+	return *endptr == '\0';
+}
+
+/** Set a config parameter of the header
+ *
+ * This updates the log->config data with a new name=value pair, possibly
+ * growing the config to hold it.  The config buffer is rounded up to pagesize
+ * of the system, so reallocations are infrequent with typical small
+ * names/values.
+ *
+ * This method does not write out the new log header. The caller is responsible for that.
+ *
+ * Returns false on failure, and sets error code/message in log.
+ */
+bool log_set_config(ccl_log_t *log, const char* name, int name_len, const char* value, int value_len) {
+	char *prev;
+	int prev_ofs, prev_len, new_len, new_config_len;
+
+	// find existing setting
+	if ((prev= log_get_config(log, name, name_len))) {
+		prev_len= strlen(prev)+1;
+	} else {
+		// if it didn't exist, set up vars so we append
+		prev= log->config + log->config_len;
+		prev_len= 0;
+	}
+	prev_ofs= prev - log->config;
+	
+	// see if new need to grow the buffer
+	new_len= value? name_len + value_len + 2 : 0;
+	new_config_len= log->config_len - prev_len + new_len;
+	if (new_config_len > log->config_alloc) {
+		if (!log_resize_configbuf(log, new_config_len))
+			return false;
+		prev= log->config + prev_ofs;
+	}
+
+	// Buffer is large enough, now.
+	// Leave prefix as-is.
+	// Move suffix (if length of setting changed)
+	if (prev_len != new_len && prev_len > 0)
+		memmove(prev + new_len, prev + prev_len, log->config_len - (prev_ofs + prev_len));
+	// overwrite setting
+	if (prev_len == 0) {
+		memcpy(prev, name, name_len);
+		prev[name_len]= '=';
+	}
+	memcpy(prev + name_len + 1, value, value_len);
+    prev[name_len+1+value_len]= '\0';
+	log->config_len= new_config_len;
+	return true;
+}
+
+// Quick accessor to return whether log is open
+inline bool log_is_open(ccl_log_t *log) {
+	return (log->fd != -1) || log->memmap;
+}
+
+#define CHAR_PREFIX(c1,c2) (( ((c2) & 0xFF) << 8) | ((c1) & 0xFF))
+#define LOG_FIELD_OFFSET(fieldname) ( ( (char*) &((ccl_log_t*)4096)->fieldname ) - (char*) 4096 ) 
+#define CHECK_FIELD(fieldname) if (0 == strcmp(name, #fieldname)) return LOG_FIELD_OFFSET(fieldname);
+
+// Returns a field offset (within ccl_log_t) by name,
+// or -1 if no field matches.
+int log_get_field_by_name(const char* name) {
+	if (!name[0] || !name[1]) return -1;
+	switch (CHAR_PREFIX(name[0], name[1])) {
+	case CHAR_PREFIX('d','e'):
+		CHECK_FIELD(default_chk_algo)
+		break;
+	case CHAR_PREFIX('m','a'):
+		CHECK_FIELD(max_message_size)
+		break;
+	case CHAR_PREFIX('s','p'):
+		CHECK_FIELD(spool_start)
+		CHECK_FIELD(spool_size)
+		break;
+	case CHAR_PREFIX('t','i'):
+		CHECK_FIELD(timestamp_precision)
+		CHECK_FIELD(timestamp_epoch)
+		break;
+	case CHAR_PREFIX('v','e'):
+		CHECK_FIELD(version)
+		break;
+	}
+	return -1;
+}
+
+/** log_set_field assigns a string or integer value to a field.
+ *
+ * field_id is the offset of the field within ccl_log_t, returned by log_get_field_by_name
+ *
+ * If svalue and ivalue are NULL, the value will be unset.
+ * If only svalue is given, ivalue will be parsed form it as needed.
+ * If only ivalue is given, svalue will be formatted as needed.
+ * If both are given, they will be considered equivalent representations.
+ *
+ * Returns true if the value was set.
+ * Returns false if anything went wrong, with a code and message in log.
+ */
+bool log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t *ivalue) {
+	int64_t i;
+	char buffer[20], *endptr;
+	size_t n;
+	
+	if (svalue && !ivalue) {
+		i= strtoll(svalue, &endptr, 0);
+		if (!*endptr)
+			ivalue= &i;
+	}
+	if (ivalue && !svalue) {
+		sprintf(buffer, "%lld", (long long ) *ivalue);
+		svalue= buffer;
+	}
+	
+	switch (field_id) {
+	case LOG_FIELD_OFFSET(default_chk_algo):
+		if (!ivalue || *ivalue < CCL_MSG_CHK_NONE || *ivalue > CCL_MSG_CHK_SHA1)
+			return SET_ERR(log, CCL_EBADPARAM, "Invalid checksum algorithm id");
+		log->default_chk_algo= (int) *ivalue;
+		return true;
+	case LOG_FIELD_OFFSET(max_message_size):
+		if ((svalue && !ivalue) || *ivalue < 0)
+			return SET_ERR(log, CCL_EBADPARAM, "Invalid max message size");
+		log->max_message_size= ivalue? *ivalue : (1<<(sizeof(log->max_message_size)*8-1))-1;
+		return true;
+	case LOG_FIELD_OFFSET(name):
+		if (!svalue && log->name) {
+			free(log->name);
+			log->name= NULL;
+		} else if (svalue) {
+			n= strlen(svalue)+1;
+			char *buf= realloc(log->name, n);
+			if (!buf)
+				return SET_ERR(log, CCL_ESYSERR, "realloc failed");
+			log->name= buf;
+			memcpy(log->name, svalue, n);
+		}
+		return true;
+	case LOG_FIELD_OFFSET(spool_size):
+		if (!ivalue || *ivalue < 0)
+			return SET_ERR(log, CCL_EBADPARAM, "Invalid spool size");
+		log->spool_size= *ivalue;
+		return true;
+	case LOG_FIELD_OFFSET(timestamp_precision):
+		if (!ivalue || *ivalue < 0 || *ivalue >= 64)
+			return SET_ERR(log, CCL_EBADPARAM, "Invalid timestamp precision");
+		log->timestamp_precision= *ivalue;
+		return true;
+	case LOG_FIELD_OFFSET(timestamp_epoch):
+		if (!ivalue)
+			return SET_ERR(log, CCL_EBADPARAM, "Invalid timestamp epoch");
+		log->timestamp_epoch= *ivalue;
+		return true;
+	}
+	return SET_ERR(log, CCL_EBADPARAM, "");
+}
+
+/** Gets the value of the named option as either string or integer
+ *
+ * If str_out is given, then str_len must also be given and specifies the size of the buffer.
+ * str_len will be updated to the length of the string.  Note that the input is a **buffer size**
+ * and the output is a **string length** (not including NUL).
+ *
+ * If int_out is given, the function attempts to parse the value as a number, and if fails,
+ * returns false with an error in log.
+ */
+bool ccl_get_option(ccl_log_t *log, const char* name, char *str_out, int *str_len, int64_t *int_out) {
+	int tmp_i, name_len;
+	char buffer[20], *endptr;
+	const char *setting;
+	int64_t tmp;
+	
+	name_len= strlen(name);
+	
+	// find existing setting
+	if (!(setting= log_get_config(log, name, name_len)))
+		return SET_ERR(log, CCL_ENOTFOUND, "");
+	
+	// If they want it in a buffer, ensure size, and copy it.
+	if (str_out) {
+		if (!str_len || *str_len < 1)
+			return SET_ERR(log, CCL_EBADPARAM, "str_len required");
+		// buffer size check
+		tmp_i= *str_len;
+		*str_len= strlen(setting + name_len + 1);
+		if (*str_len >= tmp_i)
+			return SET_ERR(log, CCL_EBUFFERSIZE, "");
+		memcpy(buffer, setting + name_len + 1, *str_len+1);
+	}
+
+	// If they want it as an int, parse it.
+	if (int_out) {
+		tmp= strtoll(setting + name_len + 1, &endptr, 0);
+		if (*endptr)
+			return SET_ERR(log, CCL_EBADPARAM, "Setting is not an integer value");
+		*int_out= tmp;
+	}
+
+	return true;
+}
+
+/** Set the value of an option from either a string or an integer.
+ *
+ * This can be used to set all sorts of options, but most cannot be changed
+ * once the log is opened.  As such, this function is mostly for setting defaults
+ * for a new log.
+ *
+ * In the future, this will be able to dynamically update things like spool-size
+ * or timestamp_precision by rewriting the entire log.
+ */
+bool ccl_set_option(ccl_log_t *log, const char* name, const char *svalue, int64_t *ivalue) {
+	int field_id, name_len;
+	ccl_log_t tmp_log;
+	char str[20];
+	
+	if (!(name_len= strlen(name)) || strchr(name, '='))
+		return SET_ERR(log, CCL_EBADPARAM, "invalid name");
+	
+	if (ivalue && !svalue) {
+		sprintf(str, "%lld", (long long) *ivalue);
+		svalue= str;
+	}
+
+	// If the logfile is open, we need to so some analysis on whether we need to re-write
+	// the whole thing, or if we can update just the header
+	// TODO: do the hard logic.  Until then, disallow updates to an existing log.
+	if (log_is_open(log))
+		return SET_ERR(log, CCL_ELOGSTATE, "Can't set fields on open log");
+
+	// save a copy
+	memcpy(&tmp_log, log, sizeof(tmp_log));
+	
+	// Is it a built-in field?
+	if ((field_id= log_get_field_by_name(name)) > 0)
+		if (!log_set_field(log, field_id, svalue, ivalue))
+			return false;
+
+	return log_set_config(log, name, name_len, svalue, strlen(svalue));
+}
+
+// utility method to resize log->iovec_buf
 bool log_resize_iovec(ccl_log_t *log, int new_count) {
 	void *newbuf;
 	newbuf= realloc(log->iovec_buf, sizeof(struct iovec) * new_count);
@@ -56,25 +364,6 @@ bool log_resize_iovec(ccl_log_t *log, int new_count) {
 		return SET_ERR(log, CCL_ESYSERR, "malloc: $syserr");
 	log->iovec_buf= newbuf;
 	log->iovec_buf_count= new_count;
-	return true;
-}
-
-bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits) {
-	if (log->fd >= 0)
-		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
-	
-	log->timestamp_epoch= epoch;
-	log->timestamp_precision= precision_bits;
-	return true;
-}
-
-bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_index, int max_message_size) {
-	if (log->fd >= 0)
-		return SET_ERR(log, CCL_ELOGSTATE, "Can't call ccl_init_* after log is open");
-	
-	log->spool_size= spool_size;
-	log->index_size= with_index? 1 : 0;
-	log->max_message_size= max_message_size;
 	return true;
 }
 
@@ -101,12 +390,14 @@ void ccl_timestamp_to_timespec(ccl_log_t *log, uint64_t ts, struct timespec *t_o
 	}
 }
 
+// utility method for seeking to offset from start of logfile
 static inline bool log_seek(ccl_log_t *log, off_t offset) {
 	if (lseek(log->fd, offset, SEEK_SET) == (off_t)-1)
 		return SET_ERR(log, CCL_ESEEK, "seek failed: $syserr");
 	return true;
 }
 
+// utility method for reading full records from current file position
 static bool log_read(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int got;
@@ -122,6 +413,8 @@ static bool log_read(ccl_log_t *log, void* record, int record_size) {
 	return true;
 }
 
+// utility method for wrapping log spool addresses within log->spool_size
+// i.e. "addr mod log->spool_size"
 static inline int64_t log_wrap_addr(ccl_log_t *log, int64_t addr) {
 	addr= addr >> 3 << 3;
 	return addr < 0? addr+log->spool_size
@@ -129,6 +422,7 @@ static inline int64_t log_wrap_addr(ccl_log_t *log, int64_t addr) {
 		: addr;
 }
 
+// utility method for reading records which might wrap around the end of the spool
 static inline bool log_readspool(ccl_log_t *log, int64_t start_addr, void *record, size_t record_size) {
 	if (!log_seek(log, log->spool_start + start_addr))
 		return false;
@@ -144,6 +438,7 @@ static inline bool log_readspool(ccl_log_t *log, int64_t start_addr, void *recor
 	return log_read(log, record, record_size);
 }
 
+// utility method for writing full records to log file
 static bool log_write(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int wrote;
@@ -157,6 +452,7 @@ static bool log_write(ccl_log_t *log, void* record, int record_size) {
 	return true;
 }
 
+// utility method for writing full iovecs to the log file
 static bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
 	int wrote;
 	while (iov_count) {
@@ -180,6 +476,7 @@ static bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
 	return true;
 }
 
+// utility method for locking a logfile
 static bool log_lock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
@@ -203,6 +500,7 @@ static bool log_lock(ccl_log_t *log) {
 	return true;
 }
 
+// utility method for unlocking a logfile
 static bool log_unlock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
@@ -219,154 +517,195 @@ static bool log_unlock(ccl_log_t *log) {
 	return true;
 }
 
-static bool log_create_file(ccl_log_t *log) {
-	ccl_log_header_t header;
-	long pagesize;
-	int64_t
-		spool_size= log->spool_size,
-		spool_start,
-		index_size= log->index_size,
-		index_start,
-		mask;
-	off_t file_size;
+static bool log_write_header(ccl_log_t *log) {
+	char *dest;
 	
-	// first, make spool_size both a multiple of the page size (if available)
-	// and a multiple of 8 otherwise.
-	pagesize= sysconf(_SC_PAGESIZE);
-	if (pagesize < 8)
-		pagesize= 8;
-	mask= pagesize-1;
-	spool_size= (spool_size + mask) & ~mask;
+	if (sizeof(log->header) + log->config_len > log->spool_size)
+		return SET_ERR(log, CCL_ELOGINVAL, "Log header overlaps message spool");
 	
-	// *if* the user wants an index...
-	if (log->index_size > 0) {
-		// determine the index size from spool_size
-		// (one index entry for each CCL_INDEX_GRANULARITY of spool)
-		index_size= ((spool_size + CCL_INDEX_GRANULARITY - 1) >> CCL_INDEX_GRANULARITY_BITS)
-			* sizeof(ccl_log_index_entry_t);
-		// and align the index start to the size of the entries
-		mask= sizeof(ccl_log_index_entry_t) - 1;
-		index_start= (sizeof(header) + mask) & ~mask;
+	// Build new header
+	log->header.magic=       htole64(CCL_HEADER_MAGIC);
+	log->header.version=     htole16(CCL_CURRENT_VERSION);
+	log->header.oldest_compat_version= htole16(0);
+	log->header.config_len=  htole32(log->config_len);
+	
+	// TODO: run sha1 on config
+	log->header.config_sha1;
+	
+	// If we're formatting a file, zero the file by truncating it, then set the file length
+	if (log->fd >= 0) {
+		if (!log_seek(log, 0)
+			|| !log_write(log, &log->header, sizeof(log->header))
+			|| !log_write(log, log->config, log->config_len))
+			return false;
 	}
-	// else index is disabled.
-	else {
-		index_size= 0;
-		index_start= sizeof(header);
+	else { // we're formatting a memory buffer
+		dest= (char*) log->memmap;
+		memcpy(dest, &log->header, sizeof(log->header));
+		dest += sizeof(log->header);
+		memcpy(dest, log->config, log->config_len);
+		dest += log->config_len;
+		memset(dest, 0, log->spool_start - (dest - log->memmap));
 	}
-	
-	// finally align the start of the spool
-	mask= pagesize-1;
-	spool_start= (index_start + index_size + mask) & ~mask;
-	
-	memset(&header, 0, sizeof(header));
-	header.magic=                 htole64(CCL_HEADER_MAGIC);
-	header.version=               htole32((int32_t)CCL_CURRENT_VERSION);
-	header.oldest_compat_version= htole32((int32_t)CCL_CURRENT_VERSION);
-	header.header_size=           htole32((int32_t)sizeof(header));
-	header.timestamp_precision=   htole32((int32_t)log->timestamp_precision);
-	header.timestamp_epoch=       htole64(log->timestamp_epoch);
-	header.index_start=           htole64(index_start);
-	header.index_size=            htole64(index_size);
-	header.spool_start=           htole64(spool_start);
-	header.spool_size=            htole64(spool_size);
-	header.max_message_size=      htole32((int32_t)log->max_message_size);
-	
-	file_size= spool_start+spool_size;
-	
-	// overflow check
-	if (file_size < spool_start+spool_size)
-		return SET_ERR(log, CCL_ESIZELIMIT, "Spool size exceeds implementation limits");
-	
-	// now write the file
-	
-	if (ftruncate(log->fd, file_size) < 0
-		|| !log_write(log, &header, sizeof(header))
-		)
-		return SET_ERR(log, CCL_EWRITE, "Failed to write new log: $syserr");
-	
 	return true;
 }
 
-static bool log_load_file(ccl_log_t *log) {
+#define INIT_FIELD_FROM_HEADER(fieldname) \
+		(((setting= log_get_config(log, #fieldname, strlen(#fieldname))) \
+		&& log_set_field(log, LOG_FIELD_OFFSET(fieldname), setting+strlen(#fieldname)+1, NULL)) \
+		|| SET_ERR(log, CCL_ELOGINVAL, "Invalid " #fieldname))
+#define INIT_OPT_FIELD_FROM_HEADER(fieldname) \
+		(!(setting= log_get_config(log, #fieldname, strlen(#fieldname))) \
+		|| log_set_field(log, LOG_FIELD_OFFSET(fieldname), setting+strlen(#fieldname)+1, NULL) \
+		|| SET_ERR(log, CCL_ELOGINVAL, "Invalid " #fieldname))
+
+static bool log_load_header(ccl_log_t *log) {
+	size_t config_len;
 	ccl_log_header_t header;
-	off_t file_size;
-	int extra, index_entries;
+	char *config, *setting;
+	int64_t file_size;
+	ccl_log_t oldlog;
+	bool success;
 	
-	file_size= lseek(log->fd, 0, SEEK_END);
-	if (file_size == (off_t)-1)
-		return SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
+	// Read static header fields
+	if (log->fd >= 0) {
+		file_size= lseek(log->fd, 0, SEEK_END);
+		if (file_size == (off_t)-1)
+			return SET_ERR(log, CCL_ESYSERR, "Can't seek to end of $logfile: $syserr");
+		if (!log_seek(log, 0)
+			|| !log_read(log, &header, sizeof(header)))
+			return SET_ERR(log, CCL_ESYSERR, "Can't read header: $syserr");
+	} else {
+		file_size= log->memmap_size;
+		if (log->memmap_size < sizeof(header))
+			return SET_ERR(log, CCL_ELOGINVAL, "Memory buffer is smaller than header");
+		memcpy(&header, (char*) log->memmap, sizeof(header));
+	}
 	
-	if (!log_seek(log, 0))
-		return SET_ERR(log, CCL_ESEEK, "Can't seek to start of $logfile: $syserr");
-	
-	// read basic fields
-	if (!log_read(log, &header, CCL_MIN_HEADER_SIZE))
-		return false;
-	
-	// check magic number, and determine endianness
 	if (le64toh(header.magic) != CCL_HEADER_MAGIC)
-		return SET_ERR(log, CCL_ELOGINVAL, "Bad magic number in $logfile");
+		return SET_ERR(log, CCL_ELOGINVAL, "Bad magic number");
+	if (le16toh(header.oldest_compat_version) > CCL_CURRENT_VERSION)
+		return SET_ERR(log, CCL_EUNSUPPORTED, "Log version is too new for this library");
 	
-	//if (be64toh(header.magic) == CCL_HEADER_MAGIC) {
-	//log->wrong_endian= true;
+	// Now read dynamic fields
+	config_len= le32toh(header.config_len);
+	config= (char*) malloc(config_len);
+	if (!config)
+		return SET_ERR(log, CCL_ESYSERR, "malloc failed");
 	
-	// version check
-	if (le32toh(header.oldest_compat_version) > CCL_CURRENT_VERSION)
-		return SET_ERR(log, CCL_ELOGVERSION, "$logfile version too new");
+	// --- from here on, we need to do some cleanup if we fail ---
 	
-	log->header_size= le32toh(header.header_size);
+	if (log->fd >= 0) {
+		success= log_read(log, config, config_len)
+			|| SET_ERR(log, CCL_ESYSERR, "Can't read header: $syserr");
+	} else {
+		if ((success= log->memmap_size > sizeof(header)+config_len))
+			memcpy(config, (char*) log->memmap + sizeof(header), config_len);
+		else
+			SET_ERR(log, CCL_ELOGINVAL, "Memory buffer is smaller than header");
+	}
 	
-	// recorded header_size must be at least as big as the minimum
-	if (log->header_size < CCL_MIN_HEADER_SIZE)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile specifies an invalid header size");
+	if (success) {
+		// TODO: validate SHA1 of header
+	}
 	
-	// read the rest of the header, up to the size of our header struct
-	if (log->header_size > CCL_MIN_HEADER_SIZE && sizeof(header) > CCL_MIN_HEADER_SIZE) {
-		extra= (log->header_size < sizeof(header)? log->header_size : sizeof(header)) - CCL_MIN_HEADER_SIZE;
-		if (!log_read(log, ((char*)&header)+CCL_MIN_HEADER_SIZE, extra))
+	if (!success) {
+		free(config);
+		return false;
+	}
+
+	oldlog= *log;
+	
+	log->header= header;
+	log->config= config;
+	log->config_len= config_len;
+	log->config_alloc= config_len;
+	log->version= le16toh(header.version);
+	log->name= NULL; // prevent realloc
+	
+	// parse fields
+	if (INIT_FIELD_FROM_HEADER(spool_start)
+		&& INIT_FIELD_FROM_HEADER(spool_size)
+		&& (log->spool_start+log->spool_size < file_size
+			|| SET_ERR(log, CCL_ELOGINVAL, "Message spool exceeds file_size (truncated file?)"))
+		&& INIT_FIELD_FROM_HEADER(timestamp_precision)
+		&& INIT_FIELD_FROM_HEADER(timestamp_epoch)
+		&& INIT_OPT_FIELD_FROM_HEADER(max_message_size)
+		&& INIT_OPT_FIELD_FROM_HEADER(default_chk_algo)
+		&& INIT_OPT_FIELD_FROM_HEADER(name)
+	) {
+		// On success, clean up the resources oldlog is holding onto
+		if (oldlog.name) free(oldlog.name);
+		if (oldlog.config) free(oldlog.config);
+	} else {
+		// On failure, rollback the log object fields affected
+		log->header=              oldlog.header;
+		free(log->config);
+		log->config=              oldlog.config;
+		log->config_len=          oldlog.config_len;
+		log->config_alloc=        oldlog.config_alloc;
+		log->version=             oldlog.version;
+		log->spool_start=         oldlog.spool_start;
+		log->spool_size=          oldlog.spool_size;
+		log->timestamp_precision= oldlog.timestamp_precision;
+		log->timestamp_epoch=     oldlog.timestamp_epoch;
+		log->max_message_size=    oldlog.max_message_size;
+		if (log->name) free(log->name);
+		log->name=                oldlog.name;
+		return false;
+	}
+	return true;
+}
+
+static bool log_create_log(ccl_log_t *log) {
+	long pagesize;
+	off_t file_size;
+	int64_t truncated_spool_size;
+	char buffer[20];
+	
+	// make spool_start both a multiple of the page size (if available)
+	// and a multiple of 8 otherwise.
+	pagesize= sysconf(_SC_PAGESIZE);
+	if (pagesize < 8) pagesize= 8;
+	
+	// To determine spool_start, first add it to the config,
+	// then use size of config to determine spool_start.
+	log_set_config(log, "spool_start", 11, "spool_start", 11); // start with dummy value
+	log->spool_start= ROUND_MULTIPLE(sizeof(ccl_log_header_t) + log->config_alloc + 256 /* leave some room */, pagesize);
+	log_set_config(log, "spool_start", 11, buffer, sprintf(buffer, "%lld", (long long) log->spool_start));
+	
+	file_size= log->spool_start + log->spool_size;
+	// overflow/wrap check
+	if (file_size < log->spool_start || file_size < log->spool_size)
+		return SET_ERR(log, CCL_ESIZELIMIT, "Spool size exceeds implementation limits");
+	
+	if (log->fd >= 0) { // we're formatting a file
+		// zero the file by truncating it, then set the file length
+		if (ftruncate(log->fd, 0) < 0
+			|| ftruncate(log->fd, file_size) < 0)
+			return SET_ERR(log, CCL_ESYSERR, "Failed to resize logfile");
+		// then write the header
+		if (!log_write_header(log))
 			return false;
 	}
-	
-	log->version=             le32toh(header.version);
-	log->timestamp_precision= le32toh(header.timestamp_precision);
-	log->timestamp_epoch=     le64toh(header.timestamp_epoch);
-	log->index_start=         le64toh(header.index_start);
-	log->index_size=          le64toh(header.index_size);
-	log->spool_start=         le64toh(header.spool_start);
-	log->spool_size=          le64toh(header.spool_size);
-	log->max_message_size=    le32toh(header.max_message_size);
-	
-	// Now it is safe to use the rest of the header fields we know about
-	
-	if ((uint64_t)file_size < log->spool_start + log->spool_size)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile is truncated (file size less than end of message spool)");
-	
-	if (log->index_start < log->header_size)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile index overlaps with header");
-	if (log->index_size) {
-		index_entries= log->index_size / sizeof(ccl_log_index_entry_t);
-		if (index_entries * sizeof(ccl_log_index_entry_t) != log->index_size)
-			return SET_ERR(log, CCL_ELOGINVAL, "$logfile index size is not a multiple of log_index_entry_t");
-		if (index_entries != (log->spool_size + CCL_INDEX_GRANULARITY-1) >> CCL_INDEX_GRANULARITY_BITS)
-			return SET_ERR(log, CCL_ELOGINVAL, "$logfile index size does not match spool size");
-	}
-	
-	if (log->spool_start < log->index_start + log->index_size)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool overlaps with index");
-	if (log->spool_size & 7)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile message spool size is not a multiple of 8");
-	
-	if (log->timestamp_precision < 0 || log->timestamp_precision > 64)
-		return SET_ERR(log, CCL_ELOGINVAL, "$logfile timestamp precision outside valid range");
-	
-	// Lock it for writing, if write-exclusive mode.
-	// In shared-write mode, we lock on each write operation.
-	// In read-only mode we make no locks at all.
-	if (log->writeable && !log->shared_write) {
-		if (!log_lock(log))
+	else { // we're formatting a memory buffer
+		// If we're formatting a fixed-size memory buffer, and file_size doesn't fit, truncate spool
+		// by up to 1/8 to save users the hassle of figuring out the exact spool size they can fit.
+		if (file_size > log->memmap_size) {
+			if (log->spool_start >= log->memmap_size)
+				return SET_ERR(log, CCL_ESIZELIMIT, "Settings exceeds memory buffer size");
+			truncated_spool_size= ((int64_t) log->memmap_size - (int64_t) log->spool_start) & ~(int64_t) 7;
+			if (truncated_spool_size < file_size - (file_size>>3))
+				return SET_ERR(log, CCL_ESIZELIMIT, "Message spool exceeds memory buffer size");
+			log->spool_size= truncated_spool_size;
+			log_set_config(log, "spool_size", 10, buffer, sprintf(buffer, "%lld", (long long) log->spool_size));
+		}
+
+		if (!log_write_header(log))
 			return false;
+		
+		memset((char*) log->memmap + log->spool_start, 0, log->memmap_size - log->spool_start);
 	}
-	
 	return true;
 }
 
@@ -391,8 +730,8 @@ bool ccl_open(ccl_log_t *log, const char *path, int access) {
 	
 	if (!log) return false;
 	
-	if (log->fd >= 0)
-		return SET_ERR(log, CCL_ELOGSTATE, "Log object was already opened");
+	if (log_is_open(log))
+		return SET_ERR(log, CCL_ELOGSTATE, "Log object is already open");
 	
 	create= (access & CCL_CREATE);
 	log->writeable= (access & CCL_WRITE);
@@ -403,145 +742,37 @@ bool ccl_open(ccl_log_t *log, const char *path, int access) {
 	if (log->fd < 0)
 		return SET_ERR(log, CCL_EOPEN, "Unable to open $logfile: $syserr");
 	
+	// Lock it for writing, if write-exclusive mode.
+	// In shared-write mode, we lock on each write operation.
+	// In read-only mode we make no locks at all.
+	if (log->writeable && !log->shared_write)
+		if (!log_lock(log))
+			goto fail_cleanup;
+
 	// now find the length of the file
 	file_size= lseek(log->fd, 0, SEEK_END);
-	if (file_size == (off_t)-1)
+	if (file_size == (off_t)-1) {
 		SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
+		goto fail_cleanup;
+	}
+	
 	// If file size is zero, and create was specified, initialize the log
-	// or, if file size > 0, just try loading it.
-	else if (file_size > 0 || (create && log_create_file(log))) {
-		if (log_load_file(log))
+	if (file_size == 0 && create) {
+		if (log_create_log(log))
 			return true;
 	}
+	// or, if file size > 0, just try loading it.
+	else if (file_size > 0) {
+		if (log_load_header(log))
+			return true;
+	}
+	
+fail_cleanup:
 	// if we failed, put the log object back in a closed state
 	close(log->fd);
 	log->fd= -1;
 	return false;
 }
-
-/*
-bool ccl_resize(ccl_log_t *log, const char *path, int64_t newSize, bool create, bool force) {
-	ccl_log_t newLog;
-	ccl_log_header_t header;
-	bool haveOld= false;
-	char fname[255];
-	
-	// Step one, open the old log with an exclusive lock, if the old file exists
-	// is the passed log already open?
-	if (log->fd >= 0) {
-		if (log->access == CCL_READ) {
-			log->last_err= CCL_ERDONLY;
-			log->last_errno= 0;
-			return false;
-		}
-		else if (log->access == CCL_SHARE) {
-			lock_log(log);
-		}
-		haveOld= true;
-	}
-	else {
-		if (ccl_open(log, path)) {
-			haveOld= true;
-		} else if (create && log->last_err == CCL_ELOGOPEN && log->last_errno == ENOENT) {
-		} else if (force) {
-		} else {
-			// if we can't open it, and it does exist, and we're not supposed to blow it away,
-			//  we fail.
-			return false;
-		}
-	}
-	
-	// Step two, create the new log with an alternate file name
-	if (strlen(path)+2 > sizeof(fname)) {
-		log->last_err= CCL_ESYSERR;
-		log->last_errno= ENAMETOOLONG;
-		return false;
-	}
-	strcpy(fname, path);
-	if (haveOld) strcat(fname, "~");
-	
-	ccl_init(&newLog, sizeof(newLog));
-	newLog.block_size= coerce_block_size(log->block_size);
-	newLog.size= coerce_log_size(newSize, newLog.block_size);
-	newLog.header_size= sizeof(header);
-	newLog.timestamp_precision= log->timestamp_precision;
-	newLog.version= CCL_CURRENT_VERSION;
-	newLog.max_message_size= (haveOld? log->max_message_size : CCL_DEFAULT_MAX_MESSAGE_SIZE);
-	newLog.access= CCL_WRITE;
-	
-	newLog.fd= open(fname, O_RDWR|O_CREAT|O_EXCL, 0700);
-	if (newLog.fd < 0
-		|| !lock_log(&newLog)
-		|| ftruncate(newLog.fd, newLog.size) < 0
-	) {
-		log->last_err= CCL_ERESIZECREATE;
-		log->last_errno= errno;
-		
-		// only unlink if we just now created it
-		if (newLog.fd >= 0) unlink(fname);
-		
-		ccl_destroy(&newLog);
-		return false;
-	}
-	
-	memset(&header, 0, sizeof(header));
-	header.magic= CCL_HEADER_MAGIC;
-	header.version= CCL_CURRENT_VERSION;
-	header.oldest_compat_version= 0;
-	header.size= newLog.size;
-	header.header_size= newLog.header_size;
-	header.block_size= newLog.block_size;
-	header.timestamp_precision= newLog.timestamp_precision;
-	
-	if (!write_rec(newLog.fd, &header, header.header_size)) {
-		log->last_err= CCL_ERESIZECREATE;
-		log->last_errno= errno;
-		
-		unlink(fname);
-		ccl_destroy(&newLog);
-		return false;
-	}
-	newLog.file_pos= header.header_size;
-	
-	// Now, we iterate over all the messages in the old log
-	if (haveOld) {
-		// TODO: implement
-	}
-	// We also destroy the old log.
-	if (!ccl_destroy(log))
-		return false;
-	
-	// Now, we close and delete the old log
-	if (rename(fname, path) < 0) {
-		log->last_err= CCL_ERESIZERENAME;
-		log->last_errno= errno;
-		return false;
-	}
-	
-	// And now transfer the new log internals to the passed-in log struct.
-	// The caller's log struct could possibly be an old version, so we need to take
-	//  care to only copy fields that exist inside of log->struct_size
-	
-	// log->sizeof_struct remains the same
-	log->size= newLog.size;
-	log->header_size= newLog.header_size;
-	log->block_size=  newLog.block_size;
-	log->version= newLog.version;
-	// log->max_message_size remains the same
-	// log->wrong_endian= newLog.wrong_endian;
-	// log->dirty= newLog.dirty;
-	log->access= newLog.access;
-	log->fd= newLog.fd;
-	log->file_pos= newLog.file_pos;
-	log->memmap= newLog.memmap;
-	// don't touch error codes
-	
-	// We also don't ccl_destroy(newLog) because we just transferred or freed all its allocated parts.
-	
-	// All done!
-	return true;
-}
-*/
 
 /** Encode a number as a variable number of bytes, within an int64.
  *
@@ -717,11 +948,14 @@ bool log_find_msg_header(ccl_log_t *log, int64_t addr, int64_t limit, ccl_msg_he
 	assert(addr < log->spool_start);
 	
 	// allocate buffer if non-memmap
-	if (!log->memmap) {
+	if (!log->memmap_spool) {
 		buf_len= log->spool_size > 4096? 4096 : log->spool_size;
 		buf= malloc(buf_len);
 		if (!buf)
 			return SET_ERR(log, CCL_ESYSERR, "malloc failed");
+	} else {
+		buf_len= 0;
+		buf= NULL;
 	}
 	
 	// positive limit means scan forward
@@ -1155,6 +1389,7 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	// checksum of all message data bytes, not including pading
 	switch (msg->chk_algo) {
 	case CCL_MSG_CHK_NONE: break;
+	case CCL_MSG_CHK_SHA1: chk_buf;
 	default:
 		return SET_ERR(log, CCL_EUNSUPPORTED, "BUG: unhandled cksum_algo");
 	}
@@ -1255,7 +1490,7 @@ bool ccl_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	// TODO: add support for shared write-access
 	if (log->shared_write)
 		return SET_ERR(log, CCL_EUNSUPPORTED, "Shared write is not implemented");
-	msg->address= ;
+	msg->address;
 	
 	return log_write_msg(log, msg, log->iovec_buf, iov_count+2);
 }

@@ -16,13 +16,22 @@ extern bool ccl_init(ccl_log_t *log, int struct_size);
 extern bool ccl_destroy(ccl_log_t *log);
 extern bool ccl_delete(ccl_log_t *log);
 
-extern bool ccl_init_timestamp_params(ccl_log_t *log, int64_t epoch, int precision_bits);
-extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool with_index, int max_message_size);
+extern bool ccl_get_option(ccl_log_t *log, const char *name, char *str_out, int *str_len, int64_t *int_out);
+extern bool ccl_set_option(ccl_log_t *log, const char *name, const char *svalue, int64_t *ivalue);
 
-#define CCL_READ   0
-#define CCL_WRITE  1
-#define CCL_SHARE  2
-#define CCL_CREATE 4
+inline bool ccl_get_option_str(ccl_log_t *log, const char *name, char *str_out, int *str_len) {
+	return ccl_get_option(log, name, str_out, str_len, NULL);
+}
+inline bool ccl_get_option_int(ccl_log_t *log, const char *name, int64_t *int_out) {
+	return ccl_get_option(log, name, NULL, NULL, int_out);
+}
+
+inline bool ccl_set_option_str(ccl_log_t *log, const char *name, const char *str) {
+	return ccl_set_option(log, name, str, NULL);
+}
+inline bool ccl_set_option_int(ccl_log_t *log, const char *name, int64_t val) {
+	return ccl_set_option(log, name, NULL, &val);
+}
 
 // Users should ignore messages of type OOB
 #define CCL_MSG_TYPE_UNDEF   0
@@ -57,7 +66,12 @@ extern bool ccl_init_geometry_params(ccl_log_t *log, int64_t spool_size, bool wi
 #define CCL_MSG_LEVEL_ALERT   10
 #define CCL_MSG_LEVEL_EMERG   12
 
+#define CCL_READ   0
+#define CCL_WRITE  1
+#define CCL_SHARE  2
+#define CCL_CREATE 4
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
+
 
 typedef struct ccl_msg_s {
 	int64_t address;
@@ -76,7 +90,7 @@ extern bool ccl_msg_init(ccl_msg_t *msg);
 extern bool ccl_msg_destroy(ccl_msg_t *msg);
 
 extern bool ccl_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count);
-inline bool ccl_write_msg_(ccl_log_t *log, ccl_msg_t msg) {
+inline bool ccl_write_msg_str(ccl_log_t *log, ccl_msg_t msg) {
 	return ccl_write_msg(log, &msg, NULL, 0);
 }
 
