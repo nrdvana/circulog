@@ -55,6 +55,9 @@ echo "Makefile created at $buildroot";
 	echo "#define CONFIG_PCRE"
 	echo "#include <pcre.h>"
 	
+	echo "// Likewise for openSSL"
+	echo "#include <openssl/sha.h>"
+	
 } > "$buildroot/config.h"
 
 echo "Created config.h"

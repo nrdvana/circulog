@@ -239,7 +239,7 @@ bool log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t *iv
 	case LOG_FIELD_OFFSET(max_message_size):
 		if ((svalue && !ivalue) || *ivalue < 0)
 			return SET_ERR(log, CCL_EBADPARAM, "Invalid max message size");
-		log->max_message_size= ivalue? *ivalue : (1<<(sizeof(log->max_message_size)*8-1))-1;
+		log->max_message_size= ivalue? *ivalue : (-1<<(sizeof(log->max_message_size)*8-1));
 		return true;
 	case LOG_FIELD_OFFSET(name):
 		if (!svalue && log->name) {
@@ -529,8 +529,8 @@ static bool log_write_header(ccl_log_t *log) {
 	log->header.oldest_compat_version= htole16(0);
 	log->header.config_len=  htole32(log->config_len);
 	
-	// TODO: run sha1 on config
-	log->header.config_sha1;
+	// run sha1 on config
+	SHA1((unsigned char*) log->config, log->config_len, (unsigned char*) log->header.config_sha1);
 	
 	// If we're formatting a file, zero the file by truncating it, then set the file length
 	if (log->fd >= 0) {
@@ -1310,6 +1310,7 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	char *footer_buf= buffer+sizeof(buffer); // grows backward
 	char *chk_buf, *buf_tmp;
 	size_t header_buf_len, footer_buf_len;
+	SHA_CTX sha1;
 	
 	size_t msg_len, msg_len2, cksum_len, padding_len, n, tmp;
 	int64_t addr= msg->address, frame_len;
@@ -1329,11 +1330,10 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	assert(((msg->level+3) >> 4) == 0);
 	
 	switch (msg->chk_algo) {
-	case CCL_MSG_CHK_NONE: cksum_len= 0; break;
-	case CCL_MSG_CHK_CRC32:
-	case CCL_MSG_CHK_CRC64:
-	case CCL_MSG_CHK_SHA1:
-		return SET_ERR(log, CCL_EUNSUPPORTED, "Unimplemented checksum algorithm");
+	case CCL_MSG_CHK_NONE:  cksum_len=  0; break;
+	case CCL_MSG_CHK_CRC32: cksum_len=  4; break;
+	case CCL_MSG_CHK_CRC64: cksum_len=  8; break;
+	case CCL_MSG_CHK_SHA1:  cksum_len= 20; break;
 	default:
 		return SET_ERR(log, CCL_EBADPARAM, "Undefined checksum algorithm");
 	}
@@ -1389,9 +1389,14 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	// checksum of all message data bytes, not including pading
 	switch (msg->chk_algo) {
 	case CCL_MSG_CHK_NONE: break;
-	case CCL_MSG_CHK_SHA1: chk_buf;
+	case CCL_MSG_CHK_SHA1:
+		SHA1_Init(&sha1);
+		for (i= 1; i < iov_count-1; i++)
+			SHA1_Update(&sha1, (unsigned char*) iov[i].iov_base, iov[i].iov_len);
+		SHA1_Final((unsigned char*) chk_buf, &sha1);
+		break;
 	default:
-		return SET_ERR(log, CCL_EUNSUPPORTED, "BUG: unhandled cksum_algo");
+		return SET_ERR(log, CCL_EUNSUPPORTED, "Unimplemented checksum algorithm");
 	}
 
 	// set up iovecs for header & footer
