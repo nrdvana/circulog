@@ -124,12 +124,18 @@ typedef struct ccl_msg_footer_s {
  * init and destroy for you.
  */
 typedef struct ccl_log_s {
-	// Log-specific parameters
+	// Log open/access parameters
+	int fd;
+	volatile char *memmap, *memmap_spool;
+	size_t memmap_size;
+	bool writeable: 1;
+
+	// Copies of log header
 	ccl_log_header_t header;
 	char* config;
 	size_t config_len, config_alloc;
 	
-	// Parsed versions of key settings
+	// Parsed versions of important config settings
 	char *name;
 	int version;
 	int timestamp_precision;
@@ -138,13 +144,7 @@ typedef struct ccl_log_s {
 	int default_chk_algo;
 	off_t spool_start, spool_size;
 	
-	bool writeable: 1,
-	     shared_write: 1;
-	int fd;
-	volatile char *memmap, *memmap_spool;
-	size_t memmap_size;
-
-	// a temporary allocated struct we re-use between calls to write
+	// temp buffer used by write, but allocate here so we can re-use
 	int iovec_buf_count;
 	struct iovec *iovec_buf;
 	int64_t spool_write_pos;
