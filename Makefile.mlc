@@ -5,7 +5,7 @@ targets = libcirculog circulog-util
 circulog_util_src = circulog-util.c
 circulog_util_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(circulog_util_src))) libcirculog.a
 
-libcirculog_src = libcirculog.c
+libcirculog_src = libcirculog.c log_config.c
 libcirculog_objs = $(patsubst %.c,%.o, $(patsubst %.cpp,%.o, $(libcirculog_src)))
 
 CCOPTS += -Os -g3

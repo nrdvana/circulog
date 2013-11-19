@@ -116,6 +116,22 @@ typedef struct ccl_msg_footer_s {
 	( ( (((sizeof_size)<<1)+(size)) >> 3) + 3) << 3 \
 )
 
+/** ccl_config_t: circulog configuration struct
+ *
+ * Struct which manages settings of a circulog.  Circulog supports arbitrary
+ * settings, in addition to the core settings.  The settings are stored in a
+ * buffer much like environment variables.
+ */
+typedef struct ccl_config_s {
+	size_t allocated;
+	size_t settings_len;
+	char settings[];
+} ccl_config_t;
+
+bool  ccl_config_resize(ccl_config_t **cfg, int new_len);
+char* ccl_config_get(ccl_config_t *cfg, const char* name, int name_len);
+bool  ccl_config_set(ccl_config_t **cfg, const char* name, int name_len, const char* value, int value_len);
+
 /** ccl_log_t: circulog object representing an open log.
  *
  * This struct is permitted to exist in varying states of validity.
@@ -130,10 +146,7 @@ typedef struct ccl_log_s {
 	size_t memmap_size;
 	bool writeable: 1;
 
-	// Copies of log header
-	ccl_log_header_t header;
-	char* config;
-	size_t config_len, config_alloc;
+	ccl_config_t *config;
 	
 	// Parsed versions of important config settings
 	char *name;
@@ -157,8 +170,15 @@ typedef struct ccl_log_s {
 
 #include "circulog.h"
 
-bool log_set_config(ccl_log_t *log, const char* name, int name_len, const char* value, int value_len);
-char* log_get_config(ccl_log_t *log, const char* name, int name_len);
+// Quick accessor to return whether log is open (either file or shared mem)
+inline bool ccl_log_is_open(ccl_log_t *log) {
+	return log->memmap || (log->fd >= 0);
+}
+
+int  ccl_log_field_by_name(const char* name);
+bool ccl_log_get_field(ccl_log_t *log, int field_id, char *str_out, int *str_len, int64_t *int_out);
+bool ccl_log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t *ivalue);
+bool ccl_log_clone_config(ccl_log_t *src, ccl_log_t *dest);
 
 #define CCL_MSG_HEADER_BUFFER_BYTES 20
 bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header);
@@ -173,5 +193,12 @@ typedef int ccl_binary_search_callback_t(void* callback_data, ccl_msg_header_t *
 bool log_find_msg_header_binsearch(ccl_log_t *log, ccl_binary_search_callback_t *decision, void *decision_data, ccl_msg_header_t *header);
 
 bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count);
+
+static inline bool SET_ERR(ccl_log_t *log, int code, const char* msg) {
+	log->last_err= code;
+	log->last_errno= errno;
+	log->last_errmsg= msg;
+	return false;
+}
 
 #endif
