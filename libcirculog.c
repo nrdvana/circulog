@@ -30,22 +30,29 @@ bool ccl_init(ccl_log_t *log, int struct_size) {
 
 bool ccl_destroy(ccl_log_t *log) {
 	bool err= false;
-	if (log->memmap) {
-		err= err || munmap((void*) log->memmap, (size_t) log->memmap_size);
-		log->memmap= NULL;
-		log->memmap_spool= NULL;
-		log->memmap_size= 0;
-	}
 	if (log->fd >= 0) {
+		if (log->memmap) {
+			err= err || munmap((void*) log->memmap, (size_t) log->memmap_size);
+			log->memmap= NULL;
+			log->memmap_spool= NULL;
+			log->memmap_size= 0;
+		}
 		err= err || close(log->fd);
 		log->fd= -1;
+	}
+	if (log->config) {
+		free(log->config);
+		log->config= NULL;
 	}
 	if (log->iovec_buf) {
 		free(log->iovec_buf);
 		log->iovec_buf= NULL;
 		log->iovec_buf_count= 0;
 	}
-	log_config_destroy(log->config);
+	if (log->name) {
+		free(log->name);
+		log->name= NULL;
+	}
 	return !err;
 }
 
@@ -110,32 +117,17 @@ static inline int64_t log_wrap_addr(ccl_log_t *log, int64_t addr) {
 
 // utility method for reading records which might wrap around the end of the spool
 static inline bool log_readspool(ccl_log_t *log, int64_t start_addr, void *record, size_t record_size) {
-	if (!log_seek(log, log->spool_start + start_addr))
+	if (!ccl_log_seek(log, log->spool_start + start_addr))
 		return false;
 	if (start_addr+record_size > log->spool_size) {
 		int n= (int) (log->spool_size - start_addr);
-		if (!log_read(log, record, n))
-			return false;
-		if (!log_seek(log, log->spool_start))
+		if (!ccl_log_read(log, record, n)
+			|| !ccl_log_seek(log, log->spool_start))
 			return false;
 		record= (void*) ((char*) record + n);
 		record_size -= n;
 	}
 	return log_read(log, record, record_size);
-}
-
-// utility method for writing full records to log file
-static bool log_write(ccl_log_t *log, void* record, int record_size) {
-	int count= 0;
-	int wrote;
-	while (count < record_size) {
-		wrote= write(log->fd, ((char*)record)+count, record_size-count);
-		if (wrote > 0)
-			count+= wrote;
-		else if (wrote < 0 && errno != EINTR)
-			return SET_ERR(log, CCL_EWRITE, "write failed: $syserr");
-	}
-	return true;
 }
 
 // utility method for writing full iovecs to the log file
@@ -173,14 +165,14 @@ bool ccl_log_lock(ccl_log_t *log) {
 	lock.l_start= 0;
 	lock.l_len= sizeof(ccl_log_header_t);
 	
-	if (log->shared_write) {
+//	if (log->shared_write) {
 		// TODO: this is cheesy, but works for now.  Think up a better interface for write timeouts.
-		alarm(3);
-		ret= fcntl(log->fd, F_SETLKW, &lock);
-		alarm(0);
-	} else {
+//		alarm(3);
+//		ret= fcntl(log->fd, F_SETLKW, &lock);
+//		alarm(0);
+//	} else {
 		ret= fcntl(log->fd, F_SETLK, &lock);
-	}
+//	}
 	if (ret < 0)
 		return SET_ERR(log, CCL_ELOCK, "Failed to lock $logfile for writing: $syserr");
 	return true;
@@ -850,11 +842,11 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 		}
 	}
 	else {
-		if (!log_seek(log, log->spool_start + addr))
+		if (!ccl_log_seek(log, log->spool_start + addr))
 			return false;
 		// If we don't wrap the spool, we can use a single writev().
 		if (addr + frame_len <= log->spool_size) {
-			if (!log_writev(log, iov, iov_count))
+			if (!ccl_log_writev(log, iov, iov_count))
 				return false;
 		}
 		// Else, we have to split the iovec[] into 2 segments.
@@ -876,12 +868,12 @@ bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 			if (!success) return false;
 
 			// second half
-			if (!log_seek(log, log->spool_start))
+			if (!ccl_log_seek(log, log->spool_start))
 				return false;
 			buf_tmp= (char*) iov[i].iov_base;
 			iov[i].iov_base= buf_tmp+n;
 			iov[i].iov_len -= n;
-			success= log_writev(log, iov+i, iov_count-i);
+			success= ccl_log_writev(log, iov+i, iov_count-i);
 			iov[i].iov_base= buf_tmp;
 			iov[i].iov_len= tmp;
 			if (!success) return false;
@@ -912,7 +904,7 @@ bool ccl_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_co
 	// we build a new io vector with room for the prefix, user's vectors, and suffix.
 	// (we re-use an iovec which we keep in log->iovec_buf)
 	if (log->iovec_buf_count < iov_count+2)
-		if (!log_resize_iovec(log, iov_count+2))
+		if (!ccl_log_resize_iovec(log, iov_count+2))
 			return false;
 	memcpy(log->iovec_buf+1, iov, sizeof(*iov) * iov_count);
 	log->iovec_buf[0].iov_len= 0;
