@@ -70,6 +70,7 @@ inline bool ccl_set_option_int(ccl_log_t *log, const char *name, int64_t val) {
 #define CCL_WRITE  1
 #define CCL_SHARE  2
 #define CCL_CREATE 4
+#define CCL_MMAP   8
 extern bool ccl_open(ccl_log_t *log, const char *path, int access);
 
 

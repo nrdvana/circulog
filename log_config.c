@@ -104,8 +104,7 @@ bool ccl_config_set(ccl_config_t **cfg, const char* name, int name_len, const ch
 }
 
 #define CHAR_PREFIX(c1,c2) (( ((c2) & 0xFF) << 8) | ((c1) & 0xFF))
-#define LOG_FIELD_OFFSET(fieldname) ( ( (char*) &((ccl_log_t*)4096)->fieldname ) - (char*) 4096 ) 
-#define CHECK_FIELD(fieldname) if (0 == strcmp(name, #fieldname)) return LOG_FIELD_OFFSET(fieldname);
+#define CHECK_FIELD(fieldname) if (0 == strcmp(name, #fieldname)) return CCL_LOG_FIELD_OFFSET(fieldname);
 
 // Returns a field offset (within ccl_log_t) by name,
 // or -1 if no field matches.
@@ -141,22 +140,22 @@ bool ccl_log_get_field(ccl_log_t *log, int field_id, char *str_out, int *str_len
 	assert((str_out && str_len && !int_out) || (!str_out && !str_len && int_out));
 	
 	switch (field_id) {
-	case LOG_FIELD_OFFSET(default_chk_algo):
+	case CCL_LOG_FIELD_OFFSET(default_chk_algo):
 		int_tmp= log->default_chk_algo;
 		break;
-	case LOG_FIELD_OFFSET(max_message_size):
+	case CCL_LOG_FIELD_OFFSET(max_message_size):
 		int_tmp= log->max_message_size;
 		break;
-	case LOG_FIELD_OFFSET(name):
+	case CCL_LOG_FIELD_OFFSET(name):
 		str_tmp= log->name;
 		break;
-	case LOG_FIELD_OFFSET(spool_size):
+	case CCL_LOG_FIELD_OFFSET(spool_size):
 		int_tmp= log->spool_size;
 		break;
-	case LOG_FIELD_OFFSET(timestamp_precision):
+	case CCL_LOG_FIELD_OFFSET(timestamp_precision):
 		int_tmp= log->timestamp_precision;
 		break;
-	case LOG_FIELD_OFFSET(timestamp_epoch):
+	case CCL_LOG_FIELD_OFFSET(timestamp_epoch):
 		int_tmp= log->timestamp_epoch;
 		break;
 	default:
@@ -216,17 +215,17 @@ bool ccl_log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t
 	}
 	
 	switch (field_id) {
-	case LOG_FIELD_OFFSET(default_chk_algo):
+	case CCL_LOG_FIELD_OFFSET(default_chk_algo):
 		if (!ivalue || *ivalue < CCL_MSG_CHK_NONE || *ivalue > CCL_MSG_CHK_SHA1)
 			return SET_ERR(log, CCL_EBADPARAM, "invalid default_chk_algo");
 		log->default_chk_algo= (int) *ivalue;
 		return true;
-	case LOG_FIELD_OFFSET(max_message_size):
+	case CCL_LOG_FIELD_OFFSET(max_message_size):
 		if ((svalue && !ivalue) || *ivalue < 0)
 			return SET_ERR(log, CCL_EBADPARAM, "invalid max_message_size");
 		log->max_message_size= ivalue? *ivalue : (-1<<(sizeof(log->max_message_size)*8-1));
 		return true;
-	case LOG_FIELD_OFFSET(name):
+	case CCL_LOG_FIELD_OFFSET(name):
 		if (!svalue && log->name) {
 			free(log->name);
 			log->name= NULL;
@@ -241,23 +240,37 @@ bool ccl_log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t
 			log->name= buf;
 		}
 		return true;
-	case LOG_FIELD_OFFSET(spool_size):
+	case CCL_LOG_FIELD_OFFSET(spool_size):
 		if (!ivalue || *ivalue < 0)
 			return SET_ERR(log, CCL_EBADPARAM, "invalid spool_size");
 		log->spool_size= *ivalue;
 		return true;
-	case LOG_FIELD_OFFSET(timestamp_precision):
+	case CCL_LOG_FIELD_OFFSET(timestamp_precision):
 		if (!ivalue || *ivalue < 0 || *ivalue >= 64)
 			return SET_ERR(log, CCL_EBADPARAM, "invalid timestamp_precision");
 		log->timestamp_precision= *ivalue;
 		return true;
-	case LOG_FIELD_OFFSET(timestamp_epoch):
+	case CCL_LOG_FIELD_OFFSET(timestamp_epoch):
 		if (!ivalue)
 			return SET_ERR(log, CCL_EBADPARAM, "invalid timestamp_epoch");
 		log->timestamp_epoch= *ivalue;
 		return true;
 	}
 	return SET_ERR(log, CCL_EBADPARAM, "");
+}
+
+#define STORE_INT_FIELD(fieldname) \
+	ccl_config_set(&log->config, #fieldname, strlen(#fieldname), \
+		buffer, sprintf(buffer, "%lld", (long long) log->fieldname))
+bool ccl_log_store_fields_in_config(ccl_log_t *log) {
+	char buffer[20];
+	return (STORE_INT_FIELD(default_chk_algo)
+		&& STORE_INT_FIELD(max_message_size)
+		&& STORE_INT_FIELD(spool_size)
+		&& STORE_INT_FIELD(timestamp_precision)
+		&& STORE_INT_FIELD(timestamp_epoch)
+		&& ccl_config_set(&log->config, "name", 4, log->name, strlen(log->name))
+		) || SET_ERR(log, CCL_ESYSERR, "malloc failed");
 }
 
 bool ccl_log_clone_config(ccl_log_t *src, ccl_log_t *dest) {

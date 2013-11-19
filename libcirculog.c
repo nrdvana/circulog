@@ -50,7 +50,7 @@ bool ccl_destroy(ccl_log_t *log) {
 }
 
 // utility method to resize log->iovec_buf
-bool log_resize_iovec(ccl_log_t *log, int new_count) {
+bool ccl_log_resize_iovec(ccl_log_t *log, int new_count) {
 	void *newbuf;
 	newbuf= realloc(log->iovec_buf, sizeof(struct iovec) * new_count);
 	if (!newbuf)
@@ -83,15 +83,8 @@ void ccl_timestamp_to_timespec(ccl_log_t *log, uint64_t ts, struct timespec *t_o
 	}
 }
 
-// utility method for seeking to offset from start of logfile
-static inline bool log_seek(ccl_log_t *log, off_t offset) {
-	if (lseek(log->fd, offset, SEEK_SET) == (off_t)-1)
-		return SET_ERR(log, CCL_ESEEK, "seek failed: $syserr");
-	return true;
-}
-
 // utility method for reading full records from current file position
-static bool log_read(ccl_log_t *log, void* record, int record_size) {
+bool log_read(ccl_log_t *log, void* record, int record_size) {
 	int count= 0;
 	int got;
 	while (count < record_size) {
@@ -146,7 +139,7 @@ static bool log_write(ccl_log_t *log, void* record, int record_size) {
 }
 
 // utility method for writing full iovecs to the log file
-static bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
+bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
 	int wrote;
 	while (iov_count) {
 		wrote= writev(log->fd, iov, iov_count);
@@ -169,9 +162,8 @@ static bool log_writev(ccl_log_t *log, struct iovec *iov, int iov_count) {
 	return true;
 }
 
-/*
 // utility method for locking a logfile
-static bool log_lock(ccl_log_t *log) {
+bool ccl_log_lock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
 	
@@ -195,7 +187,7 @@ static bool log_lock(ccl_log_t *log) {
 }
 
 // utility method for unlocking a logfile
-static bool log_unlock(ccl_log_t *log) {
+bool ccl_log_unlock(ccl_log_t *log) {
 	struct flock lock;
 	int ret;
 	
@@ -209,286 +201,6 @@ static bool log_unlock(ccl_log_t *log) {
 	if (ret < 0)
 		return SET_ERR(log, CCL_ELOCK, "Failed to unlock $logfile: $syserr");
 	return true;
-}
-*/
-
-static bool log_write_header(ccl_log_t *log) {
-	char *dest;
-	
-	if (sizeof(log->header) + log->config_len > log->spool_size)
-		return SET_ERR(log, CCL_ELOGINVAL, "Log header overlaps message spool");
-	
-	// Build new header
-	log->header.magic=       htole64(CCL_HEADER_MAGIC);
-	log->header.version=     htole16(CCL_CURRENT_VERSION);
-	log->header.oldest_compat_version= htole16(0);
-	log->header.config_len=  htole32(log->config_len);
-	
-	// run sha1 on config
-	SHA1((unsigned char*) log->config, log->config_len, (unsigned char*) log->header.config_sha1);
-	
-	// If we're formatting a file, zero the file by truncating it, then set the file length
-	if (log->fd >= 0) {
-		if (!log_seek(log, 0)
-			|| !log_write(log, &log->header, sizeof(log->header))
-			|| !log_write(log, log->config, log->config_len))
-			return false;
-	}
-	else { // we're formatting a memory buffer
-		dest= (char*) log->memmap;
-		memcpy(dest, &log->header, sizeof(log->header));
-		dest += sizeof(log->header);
-		memcpy(dest, log->config, log->config_len);
-		dest += log->config_len;
-		memset(dest, 0, log->spool_start - (dest - log->memmap));
-	}
-	return true;
-}
-
-#define INIT_FIELD_FROM_HEADER(fieldname) \
-		(((setting= log_get_config(log, #fieldname, strlen(#fieldname))) \
-		&& log_set_field(log, LOG_FIELD_OFFSET(fieldname), setting+strlen(#fieldname)+1, NULL)) \
-		|| SET_ERR(log, CCL_ELOGINVAL, "Invalid " #fieldname))
-#define INIT_OPT_FIELD_FROM_HEADER(fieldname) \
-		(!(setting= log_get_config(log, #fieldname, strlen(#fieldname))) \
-		|| log_set_field(log, LOG_FIELD_OFFSET(fieldname), setting+strlen(#fieldname)+1, NULL) \
-		|| SET_ERR(log, CCL_ELOGINVAL, "Invalid " #fieldname))
-
-static bool log_load_header(ccl_log_t *log) {
-	int64_t file_size;
-	unsigned char sha1_chk[20];
-	const char *setting;
-	bool success;
-	
-	// Read static header fields
-	if (!log->memmap) {
-		file_size= lseek(log->fd, 0, SEEK_END);
-		if (file_size == (off_t)-1) {
-			memset(log->header, 0, sizeof(log->header));
-			return SET_ERR(log, CCL_ESYSERR, "Can't seek to end of $logfile: $syserr");
-		}
-		if (!log_seek(log, 0) || !log_read(log, &log->header, sizeof(log->header))) {
-			memset(log->header, 0, sizeof(log->header));
-			return SET_ERR(log, CCL_ESYSERR, "Can't read header: $syserr");
-		}
-	} else {
-		file_size= log->memmap_size;
-		if (log->memmap_size < sizeof(log->header)) {
-			memset(log->header, 0, sizeof(log->header));
-			return SET_ERR(log, CCL_ELOGINVAL, "Memory buffer is smaller than header");
-		}
-		memcpy(&log->header, (char*) log->memmap, sizeof(log->header));
-	}
-	
-	// Check magic and version
-	if (le64toh(log->header.magic) != CCL_HEADER_MAGIC)
-		return SET_ERR(log, CCL_ELOGINVAL, "Bad magic number");
-	if (le16toh(log->header.oldest_compat_version) > CCL_CURRENT_VERSION)
-		return SET_ERR(log, CCL_EUNSUPPORTED, "Log version is too new for this library");
-	
-	if (log->config) {
-		free(log->config);
-		log->config= NULL;
-		log->config_alloc= 0;
-	}
-	
-	// Now read dynamic fields
-	log->config_len= le32toh(log->header.config_len);
-	config= (char*) malloc(log->config_len);
-	if (!config) {
-		return SET_ERR(log, CCL_ESYSERR, "malloc failed");
-	log->config_alloc= log->config_len;
-	
-	if (!log->memmap) {
-		if (!log_read(log, log->config, log->config_len)) {
-			log->config_len= 0;
-			return SET_ERR(log, CCL_ESYSERR, "Can't read header: $syserr");
-		}
-	} else {
-		if (log->memmap_size < sizeof(log->header) + log->config_len) {
-			log->config_len= 0;
-			return SET_ERR(log, CCL_ELOGINVAL, "Memory buffer is smaller than header");
-		}
-		memcpy(log->config, (char*) log->memmap + sizeof(log->header), log->config_len);
-	}
-	
-	// validate SHA1 of header
-	SHA1((unsigned char*) log->config, log->config_len, sha1_chk);
-	if (memcmp(sha1_chk, log->header.config_sha1)) {
-		log->config_len= 0;
-		return SET_ERR(log, CCL_ELOGINVAL, "Header checksum mismatch");
-	}
-	
-	log->version= le16toh(log->header.version);
-
-	// Load all mandatory fields from config section of header
-	if (!INIT_FIELD_FROM_HEADER(spool_start)
-		|| !INIT_FIELD_FROM_HEADER(spool_size)
-		|| !INIT_FIELD_FROM_HEADER(timestamp_precision)
-		|| !INIT_FIELD_FROM_HEADER(timestamp_epoch))
-		return false
-	
-	// Load optional fields from header
-	if (log->spool_start+log->spool_size > file_size)
-		return SET_ERR(log, CCL_ELOGINVAL, "Message spool exceeds file_size (truncated file?)");
-	
-	// Load options from config section of header
-	if (!INIT_OPT_FIELD_FROM_HEADER(max_message_size)
-		|| !INIT_OPT_FIELD_FROM_HEADER(default_chk_algo)
-		|| !INIT_OPT_FIELD_FROM_HEADER(name))
-		return false;
-
-	return true;
-}
-
-static bool log_create_log(ccl_log_t *log) {
-	long pagesize;
-	off_t file_size;
-	int64_t truncated_spool_size;
-	char buffer[20];
-	
-	// make spool_start both a multiple of the page size (if available)
-	// and a multiple of 8 otherwise.
-	pagesize= sysconf(_SC_PAGESIZE);
-	if (pagesize < 8) pagesize= 8;
-	
-	// To determine spool_start, first add it to the config,
-	// then use size of config to determine spool_start.
-	log_set_config(log, "spool_start", 11, "spool_start", 11); // start with dummy value
-	log->spool_start= ROUND_MULTIPLE(sizeof(ccl_log_header_t) + log->config_alloc + 256 /* leave some room */, pagesize);
-	log_set_config(log, "spool_start", 11, buffer, sprintf(buffer, "%lld", (long long) log->spool_start));
-	
-	file_size= log->spool_start + log->spool_size;
-	// overflow/wrap check
-	if (file_size < log->spool_start || file_size < log->spool_size)
-		return SET_ERR(log, CCL_ESIZELIMIT, "Spool size exceeds implementation limits");
-	
-	if (log->fd >= 0) { // we're formatting a file
-		// zero the file by truncating it, then set the file length
-		if (ftruncate(log->fd, 0) < 0
-			|| ftruncate(log->fd, file_size) < 0)
-			return SET_ERR(log, CCL_ESYSERR, "Failed to resize logfile");
-		// then write the header
-		if (!log_write_header(log))
-			return false;
-	}
-	else { // we're formatting a memory buffer
-		// If we're formatting a fixed-size memory buffer, and file_size doesn't fit, truncate spool
-		// by up to 1/8 to save users the hassle of figuring out the exact spool size they can fit.
-		if (file_size > log->memmap_size) {
-			if (log->spool_start >= log->memmap_size)
-				return SET_ERR(log, CCL_ESIZELIMIT, "Settings exceeds memory buffer size");
-			truncated_spool_size= ((int64_t) log->memmap_size - (int64_t) log->spool_start) & ~(int64_t) 7;
-			if (truncated_spool_size < file_size - (file_size>>3))
-				return SET_ERR(log, CCL_ESIZELIMIT, "Message spool exceeds memory buffer size");
-			log->spool_size= truncated_spool_size;
-			log_set_config(log, "spool_size", 10, buffer, sprintf(buffer, "%lld", (long long) log->spool_size));
-		}
-
-		if (!log_write_header(log))
-			return false;
-		
-		memset((char*) log->memmap + log->spool_start, 0, log->memmap_size - log->spool_start);
-	}
-	return true;
-}
-
-/** ccl_open_file - open (and optionally create) a log
- * 
- * Opens the specified path and verifies that it is a valid log file.
- *
- * Access modes are CCL_READ, CCL_WRITE, CCL_SHARE (not supported yet).
- *
- * If create is true, and the file does not exist (or is empty) it will be
- * created according to the fields of the log struct, which can be initialized
- * to the desired values with
- *   * ccl_init_timestamp_params
- *   * ccl_init_geometry_params
- *
- * Returns true if successful, or false with a code in log->last_err on
- * failure.
- */
-bool ccl_open_file(ccl_log_t *log, const char *path, int access) {
-	bool create;
-	off_t file_size;
-	
-	if (!log) return false;
-	
-	if (log_is_open(log))
-		return SET_ERR(log, CCL_ELOGSTATE, "Log object is already open");
-	
-	create= (access & CCL_CREATE);
-	log->writeable= (access & CCL_WRITE);
-//	log->shared_write= log->writeable && (access & CCL_SHARE);
-	
-	// open the file
-	log->fd= open(path, (create? O_CREAT:0) | (log->writeable? O_RDWR : O_RDONLY), 0666);
-	if (log->fd < 0)
-		return SET_ERR(log, CCL_EOPEN, "Unable to open $logfile: $syserr");
-	
-	// Lock it for writing, if write-exclusive mode.
-	// In shared-write mode, we lock on each write operation.
-	// In read-only mode we make no locks at all.
-	if (log->writeable)
-		if (!log_lock(log))
-			goto fail_cleanup;
-
-	// find the length of the file
-	file_size= lseek(log->fd, 0, SEEK_END);
-	if (file_size == (off_t)-1) {
-		SET_ERR(log, CCL_ESEEK, "Can't seek to end of $logfile: $syserr");
-		goto fail_cleanup;
-	}
-	
-	// If file size is zero, and create was specified, initialize the log
-	if (file_size == 0 && create) {
-		if (log_create_log(log))
-			return true;
-	}
-	// or, if file size > 0, just try loading it.
-	else if (file_size > 0) {
-		if (log_load_header(log))
-			return true;
-	}
-	
-fail_cleanup:
-	// if we failed, put the log object back in a closed state
-	close(log->fd);
-	log->fd= -1;
-	return false;
-}
-
-bool ccl_open_shm(ccl_log_t *log, volatile void *shm, size_t shm_size, int access) {
-	bool create;
-	
-	if (!log) return false;
-	
-	if (log_is_open(log))
-		return SET_ERR(log, CCL_ELOGSTATE, "Log object is already open");
-	
-	create= (access & CCL_CREATE);
-	log->writeable= (access & CCL_WRITE);
-	log->memmap= (volatile char*) shm;
-	log->memmap_size= shm_size;
-	
-	// If header magic is empty, assume uninitialized (and allow create)
-	// Else must be correct log, or assume wrong data pointer or wrong format
-	
-	if (file_size == 0 && create) {
-		if (log_create_log(log))
-			return true;
-	}
-	// or, if file size > 0, just try loading it.
-	else if (file_size > 0) {
-		if (log_load_header(log))
-			return true;
-	}
-	
-fail_cleanup:
-	// if we failed, put the log object back in a closed state
-	close(log->fd);
-	log->fd= -1;
-	return false;
 }
 
 /** Encode a number as a variable number of bytes, within an int64.

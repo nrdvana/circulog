@@ -27,6 +27,7 @@ typedef struct ccl_log_header_s {
 	uint16_t version;
 	uint16_t oldest_compat_version;
 	uint32_t config_len;
+	uint64_t config_time;
 	char     config_sha1[20];
 } ccl_log_header_t;
 
@@ -147,6 +148,7 @@ typedef struct ccl_log_s {
 	bool writeable: 1;
 
 	ccl_config_t *config;
+	int64_t config_time;
 	
 	// Parsed versions of important config settings
 	char *name;
@@ -175,10 +177,17 @@ inline bool ccl_log_is_open(ccl_log_t *log) {
 	return log->memmap || (log->fd >= 0);
 }
 
+bool ccl_log_write_header(ccl_log_t *log);
+bool ccl_log_load_header(ccl_log_t *log);
+bool ccl_log_create_log(ccl_log_t *log);
+bool ccl_log_resize_iovec(ccl_log_t *log, int new_count);
+
+#define CCL_LOG_FIELD_OFFSET(fieldname) ( ( (char*) &((ccl_log_t*)4096)->fieldname ) - (char*) 4096 ) 
 int  ccl_log_field_by_name(const char* name);
 bool ccl_log_get_field(ccl_log_t *log, int field_id, char *str_out, int *str_len, int64_t *int_out);
 bool ccl_log_set_field(ccl_log_t *log, int field_id, const char *svalue, int64_t *ivalue);
 bool ccl_log_clone_config(ccl_log_t *src, ccl_log_t *dest);
+bool ccl_log_store_fields_in_config(ccl_log_t *log);
 
 #define CCL_MSG_HEADER_BUFFER_BYTES 20
 bool log_load_msg_header(ccl_log_t *log, int64_t start_addr, ccl_msg_header_t *header);
@@ -194,11 +203,24 @@ bool log_find_msg_header_binsearch(ccl_log_t *log, ccl_binary_search_callback_t 
 
 bool log_write_msg(ccl_log_t *log, ccl_msg_t *msg, struct iovec *iov, int iov_count);
 
+// utility method for setting error code/errno/message and returning false
 static inline bool SET_ERR(ccl_log_t *log, int code, const char* msg) {
 	log->last_err= code;
 	log->last_errno= errno;
 	log->last_errmsg= msg;
 	return false;
 }
+
+// utility method for seeking to offset from start of logfile
+static inline bool ccl_log_seek(ccl_log_t *log, off_t offset) {
+	if (lseek(log->fd, offset, SEEK_SET) == (off_t)-1)
+		return SET_ERR(log, CCL_ESEEK, "seek failed: $syserr");
+	return true;
+}
+
+bool ccl_log_read(ccl_log_t *log, void* record, int record_size);
+bool ccl_log_writev(ccl_log_t *log, struct iovec *iov, int iov_count);
+bool ccl_log_lock(ccl_log_t *log);
+bool ccl_log_unlock(ccl_log_t *log);
 
 #endif
