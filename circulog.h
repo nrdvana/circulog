@@ -8,7 +8,7 @@
 #include <sys/uio.h>
 
 #ifndef CCL_LIBCIRCULOG_H
-typedef struct ccl_log_s { int opaque[30]; } ccl_log_t;
+typedef struct ccl_log_s { int64_t opaque[30]; } ccl_log_t;
 #endif
 
 extern ccl_log_t *ccl_new();

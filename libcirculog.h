@@ -182,6 +182,8 @@ bool ccl_log_load_header(ccl_log_t *log);
 bool ccl_log_create_log(ccl_log_t *log);
 bool ccl_log_resize_iovec(ccl_log_t *log, int new_count);
 
+bool ccl_log_clone_err(ccl_log_t *src, ccl_log_t *dest);
+
 #define CCL_LOG_FIELD_OFFSET(fieldname) ( ( (char*) &((ccl_log_t*)4096)->fieldname ) - (char*) 4096 ) 
 int  ccl_log_field_by_name(const char* name);
 bool ccl_log_get_field(ccl_log_t *log, int field_id, char *str_out, int *str_len, int64_t *int_out);

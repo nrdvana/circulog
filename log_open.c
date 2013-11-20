@@ -303,6 +303,7 @@ bool ccl_open_file(ccl_log_t *log, const char *path, int access) {
 				&& ccl_log_seek(&tmp, 0)
 				&& ccl_log_read(&tmp, &magic, sizeof(magic))
 				&& magic == 0
+				&& ccl_log_clone_config(log, &tmp)  // re-init settings that load_header might have overwritten
 				&& ccl_log_create_log(&tmp);
 		}
 	}
@@ -335,9 +336,7 @@ bool ccl_open_file(ccl_log_t *log, const char *path, int access) {
 		return true;
 	} else {
 		// Destroy tmp, but copy error msg first
-		log->last_err= tmp.last_err;
-		log->last_errno= tmp.last_errno;
-		log->last_errmsg= tmp.last_errmsg;
+		ccl_log_clone_err(&tmp, log);
 		ccl_destroy(&tmp);
 		return false;
 	}
@@ -375,6 +374,7 @@ bool ccl_open_shm(ccl_log_t *log, volatile void *shm, size_t shm_size, int acces
 		success= create
 			&& shm_size > 8
 			&& * (int64_t*) shm == 0
+			&& ccl_log_clone_config(log, &tmp)  // re-init settings that load_header might have overwritten
 			&& ccl_log_create_log(&tmp);
 	}
 	
@@ -386,9 +386,7 @@ bool ccl_open_shm(ccl_log_t *log, volatile void *shm, size_t shm_size, int acces
 		return true;
 	} else {
 		// Destroy tmp, but copy error msg first
-		log->last_err= tmp.last_err;
-		log->last_errno= tmp.last_errno;
-		log->last_errmsg= tmp.last_errmsg;
+		ccl_log_clone_err(&tmp, log);
 		ccl_destroy(&tmp);
 		return false;
 	}
